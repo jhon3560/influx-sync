@@ -60,8 +60,9 @@ type Poller struct {
 	logger  *zap.Logger
 	cfg     PollerConfig
 
-	signalCh chan struct{} // 订阅信号（cap=1，合并语义：忙时丢弃新信号）
-	lastPoll time.Time     // 上次查询时间（最小信号间隔护栏）
+	signalCh        chan struct{} // 订阅信号（cap=1，合并语义：忙时丢弃新信号）
+	lastPoll        time.Time     // 上次查询时间（最小信号间隔护栏）
+	wakeupScheduled bool          // watermark 解锁自唤醒定时器是否已安排（防重复）
 }
 
 // NewPoller 创建轮询器。
@@ -110,17 +111,22 @@ func (p *Poller) Run(ctx context.Context) {
 	defer ticker.Stop()
 	pausedStart := time.Time{}
 	for {
+		triggered := false
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// 兜底轮询：即使无信号也按周期查询（V1.1 行为保留）
+			triggered = true // 兜底轮询：即使无信号也按周期查询（V1.1 行为保留）
 		case <-p.signalCh:
 			// 订阅信号触发：最小间隔护栏，防高频信号打满 Poller
-			if time.Since(p.lastPoll) < p.cfg.MinSignalInterval {
-				continue
+			if time.Since(p.lastPoll) >= p.cfg.MinSignalInterval {
+				triggered = true
 			}
 		}
+		if !triggered {
+			continue
+		}
+
 		usage := p.walDiskUsageRatio()
 		// 迟滞状态机：红区触发挂起，降至绿色阈值以下才恢复（防临界震荡）
 		switch state {
@@ -161,8 +167,19 @@ func (p *Poller) Run(ctx context.Context) {
 			// 黄色降速：间隔拉长至 5s，Batch 减半
 			time.Sleep(5 * time.Second)
 		}
-		p.pollOnce(ctx)
+
+		blocked := p.pollOnce(ctx)
 		p.lastPoll = time.Now()
+		// watermark 解锁自唤醒（仅信号模式）：本轮窗口被水位截断时，
+		// 安排 watermark 时长后自动再查一次，避免等待下一个 ticker 的闲置延迟
+		if blocked && !p.wakeupScheduled {
+			p.wakeupScheduled = true
+			go func() {
+				time.Sleep(p.cfg.Watermark)
+				p.wakeupScheduled = false
+				p.Notify()
+			}()
+		}
 	}
 }
 
@@ -181,41 +198,44 @@ func (p *Poller) walDiskUsageRatio() float64 {
 }
 
 // pollOnce 执行一轮查询（多窗口并行）。
-func (p *Poller) pollOnce(ctx context.Context) {
+// 返回 blocked：本轮窗口是否被 watermark 截断（信号模式据此安排解锁自唤醒）。
+func (p *Poller) pollOnce(ctx context.Context) (blocked bool) {
 	now := time.Now().UnixNano()
 	cursor := p.wal.Cursor()
 	end := cursor + int64(p.cfg.Window)
 	if maxEnd := now - int64(p.cfg.Watermark); end > maxEnd {
 		end = maxEnd
+		blocked = true
 	}
 	// 窗口上限保护：即使时间跳变/积压，单次最多查 MaxWindow
 	if end-cursor > int64(p.cfg.MaxWindow) {
 		end = cursor + int64(p.cfg.MaxWindow)
 	}
 	if end <= cursor {
-		return // 无新窗口
+		return false // 无新窗口
 	}
 
 	points, err := p.queryParallel(ctx, cursor, end)
 	if err != nil {
 		p.logger.Warn("query failed, keep cursor", zap.Error(err))
-		return // 保持游标，下轮重试
+		return false // 保持游标，下轮重试
 	}
 	p.logger.Info("poll window", zap.Int64("start", cursor), zap.Int64("end", end), zap.Int("points", len(points)))
 
 	// 先写 WAL，成功后才推进游标（顺序铁律，违反会漏数据）
 	if err := p.appendFrames(points); err != nil {
 		p.logger.Error("wal append failed, keep cursor", zap.Error(err))
-		return
+		return false
 	}
 	if err := p.wal.SetCursor(end); err != nil {
 		p.logger.Error("cursor update failed", zap.Error(err))
-		return
+		return false
 	}
 	p.metrics.SetCursor(end)
 	// 每轮刷新 WAL 状态指标（断连积压时可观测）
 	p.metrics.SetWALPending(int64(p.wal.PendingCount()))
 	p.metrics.SetWALBytes(p.wal.DiskUsage())
+	return blocked
 }
 
 // queryOptions 组装查询选项。
