@@ -248,7 +248,11 @@ func (p *Poller) queryOptions() influx.QueryOptions {
 }
 
 // queryParallel 将 [start,end) 窗口切分为 N 段并行查询，结果按段序归并。
-// 并行数<=1 时退化为单次串行查询（行为与 V1.0 完全一致）。
+// 段边界 +1ns 重叠（V1.2.3）：边界点由相邻两段重复查询，归并时按
+// Point.Key()（measurement+tags+timestamp）去重——防御 InfluxDB 高压写入时
+// 并行查询偶发漏行（实测 11:33:01.71884Z 丢 1 点）。重复查询的点由
+// InfluxDB 幂等覆盖保证不产生重复计数。
+// 并行数<=1 时退化为单次串行查询（行为与 V1.0 一致）。
 func (p *Poller) queryParallel(ctx context.Context, start, end int64) ([]model.Point, error) {
 	n := p.cfg.ParallelQueries
 	if n <= 1 {
@@ -269,6 +273,8 @@ func (p *Poller) queryParallel(ctx context.Context, start, end int64) ([]model.P
 		e := s + step
 		if i == n-1 {
 			e = end
+		} else {
+			e += 1 // 段边界重叠 1ns：边界点两段都查，归并去重
 		}
 		go func(idx int, s, e int64) {
 			pts, err := p.client.QueryRange(ctx, s, e, p.queryOptions())
@@ -276,6 +282,7 @@ func (p *Poller) queryParallel(ctx context.Context, start, end int64) ([]model.P
 		}(i, s, e)
 	}
 	all := make([]model.Point, 0, (end-start)/1e6)
+	seen := make(map[string]struct{}, (end-start)/1e6)
 	var firstErr error
 	for i := 0; i < n; i++ {
 		r := <-results
@@ -285,7 +292,14 @@ func (p *Poller) queryParallel(ctx context.Context, start, end int64) ([]model.P
 			}
 			continue
 		}
-		all = append(all, r.points...)
+		for _, pt := range r.points {
+			k := pt.Key()
+			if _, dup := seen[k]; dup {
+				continue
+			}
+			seen[k] = struct{}{}
+			all = append(all, pt)
+		}
 	}
 	if firstErr != nil {
 		return nil, firstErr
