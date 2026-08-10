@@ -13,7 +13,11 @@ const (
 	Magic       uint16 = 0x5057 // "PW"
 	Version     uint8  = 0x01
 	HeaderSize  int    = 20
-	MaxFrameLen int    = 1 << 20 // 单帧上限 1MB（含 Header）
+	MaxFrameLen int    = 1 << 20 // 压缩后单帧上限 1MB（含 Header），受隔离装置单包限制
+	// MaxDecompressedLen 解压后原始数据上限（防解压炸弹）。
+	// 注意：gzip 后 ≤1MB 并不保证解压前 ≤1MB（30000点≈2.4MB 原始），
+	// 解压限制必须独立于压缩限制，否则帧会被截断产生毒丸（V1.2.1 实测发现）。
+	MaxDecompressedLen int = 16 << 20 // 16MB；正常帧（10000点≈800KB）远小于此
 )
 
 // 消息类型。
