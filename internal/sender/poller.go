@@ -20,15 +20,16 @@ import (
 
 // PollerConfig 轮询配置。
 type PollerConfig struct {
-	Interval        time.Duration // 轮询周期，默认 1s
-	Window          time.Duration // 查询窗口，默认 5s
-	Watermark       time.Duration // 水位延迟，默认 10s
-	MaxWindow       time.Duration // 单次查询窗口上限（防时间跳变），默认 30s
-	BatchPoints     int           // 单帧点数，默认 10000
-	QueryLimit      int           // 单次查询 LIMIT（越大分页越少，扫描开销越低），默认 100000
-	ParallelQueries int           // 多窗口并行查询/组帧 worker 数，默认 4（0/1=串行）
-	TagColumns      []string      // 显式 tag 列（空=自动发现）
-	Measurements    []string      // 要同步的 measurement 列表（空=全部）
+	Interval          time.Duration // 轮询周期，默认 1s
+	Window            time.Duration // 查询窗口，默认 5s
+	Watermark         time.Duration // 水位延迟，默认 10s
+	MaxWindow         time.Duration // 单次查询窗口上限（防时间跳变），默认 30s
+	BatchPoints       int           // 单帧点数，默认 10000
+	QueryLimit        int           // 单次查询 LIMIT（越大分页越少，扫描开销越低），默认 100000
+	ParallelQueries   int           // 多窗口并行查询/组帧 worker 数，默认 4（0/1=串行）
+	MinSignalInterval time.Duration // 订阅信号最小查询间隔（防高频信号打满 Poller），默认 200ms
+	TagColumns        []string      // 显式 tag 列（空=自动发现）
+	Measurements      []string      // 要同步的 measurement 列表（空=全部）
 }
 
 // 反压三级水位（《死信隔离与反压机制逻辑》）：
@@ -50,12 +51,17 @@ const (
 )
 
 // Poller 时间窗口轮询器：查询源 Influx → 组帧 → 写 WAL → 推进游标。
+// V1.2 支持订阅信号触发：源库 SUBSCRIPTION 推送到达时立即查询（信号合并，
+// 不解析内容；丢失时由兜底 ticker 保证不漏）。
 type Poller struct {
 	client  *influx.Client
 	wal     *wal.WAL
 	metrics *monitor.Metrics
 	logger  *zap.Logger
 	cfg     PollerConfig
+
+	signalCh chan struct{} // 订阅信号（cap=1，合并语义：忙时丢弃新信号）
+	lastPoll time.Time     // 上次查询时间（最小信号间隔护栏）
 }
 
 // NewPoller 创建轮询器。
@@ -81,10 +87,23 @@ func NewPoller(client *influx.Client, w *wal.WAL, metrics *monitor.Metrics, logg
 	if cfg.ParallelQueries <= 1 {
 		cfg.ParallelQueries = 4
 	}
-	return &Poller{client: client, wal: w, metrics: metrics, logger: logger, cfg: cfg}
+	if cfg.MinSignalInterval <= 0 {
+		cfg.MinSignalInterval = 200 * time.Millisecond
+	}
+	return &Poller{client: client, wal: w, metrics: metrics, logger: logger, cfg: cfg, signalCh: make(chan struct{}, 1)}
+}
+
+// Notify 订阅信号回调：非阻塞发信号（cap=1 天然合并，Poller 忙时丢弃）。
+func (p *Poller) Notify() {
+	select {
+	case p.signalCh <- struct{}{}:
+	default:
+		// 已有待处理信号或 Poller 忙：丢弃（合并），不影响正确性
+	}
 }
 
 // Run 阻塞运行，直到 ctx 取消。
+// 驱动源：订阅信号（优先，事件驱动）+ 兜底 ticker（信号丢失/订阅失效时保底）。
 func (p *Poller) Run(ctx context.Context) {
 	state := bpNormal
 	ticker := time.NewTicker(p.cfg.Interval)
@@ -95,6 +114,12 @@ func (p *Poller) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// 兜底轮询：即使无信号也按周期查询（V1.1 行为保留）
+		case <-p.signalCh:
+			// 订阅信号触发：最小间隔护栏，防高频信号打满 Poller
+			if time.Since(p.lastPoll) < p.cfg.MinSignalInterval {
+				continue
+			}
 		}
 		usage := p.walDiskUsageRatio()
 		// 迟滞状态机：红区触发挂起，降至绿色阈值以下才恢复（防临界震荡）
@@ -137,6 +162,7 @@ func (p *Poller) Run(ctx context.Context) {
 			time.Sleep(5 * time.Second)
 		}
 		p.pollOnce(ctx)
+		p.lastPoll = time.Now()
 	}
 }
 

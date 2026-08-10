@@ -94,6 +94,16 @@ func run() error {
 	go poller.Run(ctx)
 	go senderLoop.Run(ctx)
 
+	// V1.2 订阅信号触发：配置 signal_listen 时启动信号接收器（仅信号，不解析内容）
+	if cfg.Sync.SignalListen != "" {
+		sig := sender.NewSignalListener(poller.Notify, log)
+		go func() {
+			if err := sig.Run(ctx, cfg.Sync.SignalListen); err != nil {
+				log.Error("signal listener failed (fallback to polling)", zap.Error(err))
+			}
+		}()
+	}
+
 	// 指标 HTTP 服务
 	metricsSrv := metrics.NewHTTPServer(cfg.Monitor.Addr, cfg.Monitor.Auth())
 	go func() {

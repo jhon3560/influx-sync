@@ -52,6 +52,7 @@ type SenderConfig struct {
 		BatchPoints     int      `yaml:"batch_points"`    // 单帧点数
 		QueryLimit      int      `yaml:"query_limit"`     // 单次查询 LIMIT（分页粒度）
 		ParallelQueries int      `yaml:"poller_parallel"` // 多窗口并行查询数（0=串行，默认4）
+		SignalListen    string   `yaml:"signal_listen"`   // 订阅信号监听地址（如 ":18098"）；空=纯轮询
 		Backfill        string   `yaml:"backfill"`        // 首次启动回填：游标初始化为 now-watermark-backfill
 		TagColumns      []string `yaml:"tag_columns"`     // 显式 tag 列（空=自动 SHOW TAG KEYS 发现）
 		Measurements    []string `yaml:"measurements"`    // 同步的 measurement 列表
