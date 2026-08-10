@@ -254,6 +254,37 @@ func (w *WAL) lastSegmentIdx() (int, error) {
 	return last, nil
 }
 
+// AppendEncoded 追加一帧已编码的帧字节（编码由调用方完成，锁内只做 IO）。
+// 调用方必须保证 seq 与内部 NextSeq 严格递增一致（顺序铁律），否则返回错误。
+func (w *WAL) AppendEncoded(typ uint8, seq uint64, frameBytes []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if seq != w.cp.NextSeq {
+		return fmt.Errorf("wal: out-of-order append seq=%d next=%d", seq, w.cp.NextSeq)
+	}
+	if err := w.ensureSpace(len(frameBytes) + recordHeadLen); err != nil {
+		return err
+	}
+	var head [recordHeadLen]byte
+	binary.BigEndian.PutUint32(head[:], uint32(len(frameBytes)))
+	if _, err := w.curFile.Write(head[:]); err != nil {
+		return fmt.Errorf("wal: write record head: %w", err)
+	}
+	if _, err := w.curFile.Write(frameBytes); err != nil {
+		return fmt.Errorf("wal: write frame: %w", err)
+	}
+	if err := w.curFile.Sync(); err != nil {
+		return fmt.Errorf("wal: fsync frame: %w", err)
+	}
+	w.index = append(w.index, frameIndex{
+		seg: w.curSeg, offset: w.curOffset, length: len(frameBytes), seq: seq, typ: typ,
+	})
+	w.curOffset += recordHeadLen + int64(len(frameBytes))
+	w.cp.NextSeq = seq + 1
+	return nil
+}
+
 // Append 追加一帧（内部分配 seq 并编码），成功后 fsync。
 // 返回该帧的 seq。调用方必须在成功后推进游标（SetCursor）。
 func (w *WAL) Append(typ uint8, payload []byte) (uint64, error) {

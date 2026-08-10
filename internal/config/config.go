@@ -45,15 +45,16 @@ func (c *MonitorConfig) Auth() *monitor.Auth {
 type SenderConfig struct {
 	Source influx.Config `yaml:"source"`
 	Sync   struct {
-		Interval     string   `yaml:"interval"`     // 轮询周期
-		Window       string   `yaml:"window"`       // 查询窗口
-		Watermark    string   `yaml:"watermark"`    // 水位延迟
-		MaxWindow    string   `yaml:"max_window"`   // 窗口上限（防时间跳变）
-		BatchPoints  int      `yaml:"batch_points"` // 单帧点数
-		QueryLimit   int      `yaml:"query_limit"`  // 单次查询 LIMIT（分页粒度）
-		Backfill     string   `yaml:"backfill"`     // 首次启动回填：游标初始化为 now-watermark-backfill
-		TagColumns   []string `yaml:"tag_columns"`  // 显式 tag 列（空=自动 SHOW TAG KEYS 发现）
-		Measurements []string `yaml:"measurements"` // 同步的 measurement 列表
+		Interval        string   `yaml:"interval"`        // 轮询周期
+		Window          string   `yaml:"window"`          // 查询窗口
+		Watermark       string   `yaml:"watermark"`       // 水位延迟
+		MaxWindow       string   `yaml:"max_window"`      // 窗口上限（防时间跳变）
+		BatchPoints     int      `yaml:"batch_points"`    // 单帧点数
+		QueryLimit      int      `yaml:"query_limit"`     // 单次查询 LIMIT（分页粒度）
+		ParallelQueries int      `yaml:"poller_parallel"` // 多窗口并行查询数（0=串行，默认4）
+		Backfill        string   `yaml:"backfill"`        // 首次启动回填：游标初始化为 now-watermark-backfill
+		TagColumns      []string `yaml:"tag_columns"`     // 显式 tag 列（空=自动 SHOW TAG KEYS 发现）
+		Measurements    []string `yaml:"measurements"`    // 同步的 measurement 列表
 	} `yaml:"sync"`
 	WAL struct {
 		Path        string `yaml:"path"`
@@ -211,14 +212,15 @@ func dur(s string, def time.Duration) time.Duration {
 // PollerConfig 转换。
 func (c *SenderConfig) PollerConfig() sender.PollerConfig {
 	return sender.PollerConfig{
-		Interval:     dur(c.Sync.Interval, time.Second),
-		Window:       dur(c.Sync.Window, 5*time.Second),
-		Watermark:    dur(c.Sync.Watermark, 10*time.Second),
-		MaxWindow:    dur(c.Sync.MaxWindow, 30*time.Second),
-		BatchPoints:  c.Sync.BatchPoints,
-		QueryLimit:   c.Sync.QueryLimit,
-		TagColumns:   c.Sync.TagColumns,
-		Measurements: c.Sync.Measurements,
+		Interval:        dur(c.Sync.Interval, time.Second),
+		Window:          dur(c.Sync.Window, 5*time.Second),
+		Watermark:       dur(c.Sync.Watermark, 10*time.Second),
+		MaxWindow:       dur(c.Sync.MaxWindow, 30*time.Second),
+		BatchPoints:     c.Sync.BatchPoints,
+		QueryLimit:      c.Sync.QueryLimit,
+		ParallelQueries: c.Sync.ParallelQueries,
+		TagColumns:      c.Sync.TagColumns,
+		Measurements:    c.Sync.Measurements,
 	}
 }
 

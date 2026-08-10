@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -19,14 +20,15 @@ import (
 
 // PollerConfig 轮询配置。
 type PollerConfig struct {
-	Interval     time.Duration // 轮询周期，默认 1s
-	Window       time.Duration // 查询窗口，默认 5s
-	Watermark    time.Duration // 水位延迟，默认 10s
-	MaxWindow    time.Duration // 单次查询窗口上限（防时间跳变），默认 30s
-	BatchPoints  int           // 单帧点数，默认 10000
-	QueryLimit   int           // 单次查询 LIMIT（越大分页越少，扫描开销越低），默认 100000
-	TagColumns   []string      // 显式 tag 列（空=自动发现）
-	Measurements []string      // 要同步的 measurement 列表（空=全部）
+	Interval        time.Duration // 轮询周期，默认 1s
+	Window          time.Duration // 查询窗口，默认 5s
+	Watermark       time.Duration // 水位延迟，默认 10s
+	MaxWindow       time.Duration // 单次查询窗口上限（防时间跳变），默认 30s
+	BatchPoints     int           // 单帧点数，默认 10000
+	QueryLimit      int           // 单次查询 LIMIT（越大分页越少，扫描开销越低），默认 100000
+	ParallelQueries int           // 多窗口并行查询/组帧 worker 数，默认 4（0/1=串行）
+	TagColumns      []string      // 显式 tag 列（空=自动发现）
+	Measurements    []string      // 要同步的 measurement 列表（空=全部）
 }
 
 // 反压三级水位（《死信隔离与反压机制逻辑》）：
@@ -75,6 +77,9 @@ func NewPoller(client *influx.Client, w *wal.WAL, metrics *monitor.Metrics, logg
 	}
 	if cfg.QueryLimit <= 0 {
 		cfg.QueryLimit = 100000
+	}
+	if cfg.ParallelQueries <= 1 {
+		cfg.ParallelQueries = 4
 	}
 	return &Poller{client: client, wal: w, metrics: metrics, logger: logger, cfg: cfg}
 }
@@ -149,7 +154,7 @@ func (p *Poller) walDiskUsageRatio() float64 {
 	return float64(total-avail) / float64(total)
 }
 
-// pollOnce 执行一轮查询。
+// pollOnce 执行一轮查询（多窗口并行）。
 func (p *Poller) pollOnce(ctx context.Context) {
 	now := time.Now().UnixNano()
 	cursor := p.wal.Cursor()
@@ -165,11 +170,7 @@ func (p *Poller) pollOnce(ctx context.Context) {
 		return // 无新窗口
 	}
 
-	points, err := p.client.QueryRange(ctx, cursor, end, influx.QueryOptions{
-		Measurements: p.cfg.Measurements,
-		Limit:        p.cfg.QueryLimit,
-		TagColumns:   p.cfg.TagColumns,
-	})
+	points, err := p.queryParallel(ctx, cursor, end)
 	if err != nil {
 		p.logger.Warn("query failed, keep cursor", zap.Error(err))
 		return // 保持游标，下轮重试
@@ -191,6 +192,61 @@ func (p *Poller) pollOnce(ctx context.Context) {
 	p.metrics.SetWALBytes(p.wal.DiskUsage())
 }
 
+// queryOptions 组装查询选项。
+func (p *Poller) queryOptions() influx.QueryOptions {
+	return influx.QueryOptions{
+		Measurements: p.cfg.Measurements,
+		Limit:        p.cfg.QueryLimit,
+		TagColumns:   p.cfg.TagColumns,
+	}
+}
+
+// queryParallel 将 [start,end) 窗口切分为 N 段并行查询，结果按段序归并。
+// 并行数<=1 时退化为单次串行查询（行为与 V1.0 完全一致）。
+func (p *Poller) queryParallel(ctx context.Context, start, end int64) ([]model.Point, error) {
+	n := p.cfg.ParallelQueries
+	if n <= 1 {
+		return p.client.QueryRange(ctx, start, end, p.queryOptions())
+	}
+	step := (end - start) / int64(n)
+	if step <= 0 {
+		return p.client.QueryRange(ctx, start, end, p.queryOptions())
+	}
+	type qr struct {
+		idx    int
+		points []model.Point
+		err    error
+	}
+	results := make(chan qr, n)
+	for i := 0; i < n; i++ {
+		s := start + int64(i)*step
+		e := s + step
+		if i == n-1 {
+			e = end
+		}
+		go func(idx int, s, e int64) {
+			pts, err := p.client.QueryRange(ctx, s, e, p.queryOptions())
+			results <- qr{idx, pts, err}
+		}(i, s, e)
+	}
+	all := make([]model.Point, 0, (end-start)/1e6)
+	var firstErr error
+	for i := 0; i < n; i++ {
+		r := <-results
+		if r.err != nil {
+			if firstErr == nil {
+				firstErr = r.err
+			}
+			continue
+		}
+		all = append(all, r.points...)
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return all, nil
+}
+
 // effectiveBatchPoints 降速时批次减半（黄色反压）。
 func (p *Poller) effectiveBatchPoints() int {
 	if p.metrics.BackpressureStatus() == int64(bpDegraded) {
@@ -200,6 +256,8 @@ func (p *Poller) effectiveBatchPoints() int {
 }
 
 // appendFrames 将窗口数据按 BatchPoints 分帧写入 WAL。
+// 组帧（LinesToProtocol + gzip 编码）在 worker 池并行执行，
+// 帧字节按 seq 顺序落盘（顺序铁律不变）。
 func (p *Poller) appendFrames(points []model.Point) error {
 	if len(points) == 0 {
 		return nil
@@ -208,17 +266,66 @@ func (p *Poller) appendFrames(points []model.Point) error {
 	if batch <= 0 {
 		batch = p.cfg.BatchPoints
 	}
-	for start := 0; start < len(points); start += batch {
-		end := start + batch
-		if end > len(points) {
-			end = len(points)
+	nFrames := (len(points) + batch - 1) / batch
+	baseSeq := p.wal.NextSeq()
+
+	type framed struct {
+		idx  int
+		seq  uint64
+		data []byte
+		err  error
+	}
+	frames := make(chan framed, nFrames)
+	workers := p.cfg.ParallelQueries
+	if workers <= 1 {
+		workers = 1
+	}
+	if workers > nFrames {
+		workers = nFrames
+	}
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := w; i < nFrames; i += workers {
+				start := i * batch
+				endPt := start + batch
+				if endPt > len(points) {
+					endPt = len(points)
+				}
+				lines, err := model.LinesToProtocol(points[start:endPt])
+				if err != nil {
+					frames <- framed{idx: i, err: err}
+					continue
+				}
+				payload := []byte(strings.Join(lines, "\n"))
+				fb, err := protocol.Encode(protocol.TypeData, baseSeq+uint64(i), payload)
+				if err != nil {
+					frames <- framed{idx: i, err: err}
+					continue
+				}
+				frames <- framed{idx: i, seq: baseSeq + uint64(i), data: fb}
+			}
+		}(w)
+	}
+	go func() { wg.Wait(); close(frames) }()
+
+	// 按 idx 顺序落 WAL（顺序铁律：seq 必须与 NextSeq 严格递增一致）
+	got := make([]*framed, nFrames)
+	for f := range frames {
+		ff := f
+		got[f.idx] = &ff
+	}
+	for i := 0; i < nFrames; i++ {
+		f := got[i]
+		if f == nil {
+			return fmt.Errorf("frame %d missing", i)
 		}
-		lines, err := model.LinesToProtocol(points[start:end])
-		if err != nil {
-			return fmt.Errorf("convert points: %w", err)
+		if f.err != nil {
+			return f.err
 		}
-		payload := []byte(strings.Join(lines, "\n"))
-		if _, err := p.wal.Append(protocol.TypeData, payload); err != nil {
+		if err := p.wal.AppendEncoded(protocol.TypeData, f.seq, f.data); err != nil {
 			return err
 		}
 	}
