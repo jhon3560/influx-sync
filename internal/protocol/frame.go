@@ -1,0 +1,64 @@
+// Package protocol 实现 ISFP（Influx Sync Frame Protocol）帧协议。
+//
+// Header 固定 20 字节，Big Endian：
+//
+//	| Magic(2)=0x5057 | Version(1)=0x01 | Type(1) | Seq(8) | Length(4) | CRC32(4) |
+//
+// CRC32(IEEE) 只计算 Payload；Payload = gzip(Line Protocol)。
+package protocol
+
+import "errors"
+
+const (
+	Magic       uint16 = 0x5057 // "PW"
+	Version     uint8  = 0x01
+	HeaderSize  int    = 20
+	MaxFrameLen int    = 1 << 20 // 单帧上限 1MB（含 Header）
+)
+
+// 消息类型。
+const (
+	TypeData      uint8 = 0x01 // 数据帧
+	TypeHeartbeat uint8 = 0x02 // 心跳帧
+	TypeControl   uint8 = 0x03 // 控制帧
+	TypeError     uint8 = 0xFF // 错误帧
+)
+
+// 单字节业务 ACK（正向隔离装置仅允许 0x00/0xff 返回）。
+const (
+	AckSuccess byte = 0xff
+	AckFail    byte = 0x00
+)
+
+// 协议级错误。
+var (
+	ErrBadMagic   = errors.New("protocol: bad magic")
+	ErrBadVersion = errors.New("protocol: unsupported version")
+	ErrBadCRC     = errors.New("protocol: crc mismatch")
+	ErrTooLarge   = errors.New("protocol: frame too large")
+)
+
+// Frame 解码后的协议帧（Payload 为 gzip 压缩数据）。
+type Frame struct {
+	Version uint8
+	Type    uint8
+	Seq     uint64
+	CRC     uint32
+	Payload []byte
+}
+
+// Header 原始 20 字节头部。
+type Header struct {
+	Magic   uint16
+	Version uint8
+	Type    uint8
+	Seq     uint64
+	Length  uint32
+	CRC     uint32
+}
+
+// IsHeartbeat 判断是否为心跳帧。
+func (f *Frame) IsHeartbeat() bool { return f.Type == TypeHeartbeat }
+
+// IsData 判断是否为数据帧。
+func (f *Frame) IsData() bool { return f.Type == TypeData }

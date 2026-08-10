@@ -1,0 +1,121 @@
+package protocol
+
+import (
+	"bytes"
+	"crypto/rand"
+	"hash/crc32"
+	"strings"
+	"testing"
+)
+
+func TestEncodeDecodeRoundTrip(t *testing.T) {
+	lp := []byte("power_measure,plant=A001,point=P001 value=220.5 1720000000000000000\n")
+	seq := uint64(10001)
+	frameBytes, err := EncodeData(seq, lp)
+	if err != nil {
+		t.Fatalf("EncodeData: %v", err)
+	}
+	if len(frameBytes) <= HeaderSize {
+		t.Fatalf("unexpected frame len %d", len(frameBytes))
+	}
+	f, err := Decode(frameBytes)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if f.Seq != seq || f.Type != TypeData || f.Version != Version {
+		t.Fatalf("bad frame fields: %+v", f)
+	}
+	raw, err := f.Decompress()
+	if err != nil {
+		t.Fatalf("Decompress: %v", err)
+	}
+	if !bytes.Equal(raw, lp) {
+		t.Fatalf("payload mismatch: got %q want %q", raw, lp)
+	}
+}
+
+func TestDecodeBadCRC(t *testing.T) {
+	lp := []byte("m value=1 1")
+	frameBytes, _ := EncodeData(7, lp)
+	frameBytes[len(frameBytes)-1] ^= 0xff // 破坏 payload 末字节
+	_, err := Decode(frameBytes)
+	if err == nil || !strings.Contains(err.Error(), "crc") {
+		t.Fatalf("expected crc error, got %v", err)
+	}
+}
+
+func TestDecodeBadMagic(t *testing.T) {
+	lp := []byte("m value=1 1")
+	frameBytes, _ := EncodeData(7, lp)
+	frameBytes[0] = 0x00 // 破坏 magic
+	_, err := Decode(frameBytes)
+	if err == nil || !strings.Contains(err.Error(), "magic") {
+		t.Fatalf("expected magic error, got %v", err)
+	}
+}
+
+func TestDecodeLengthMismatch(t *testing.T) {
+	lp := []byte("m value=1 1")
+	frameBytes, _ := EncodeData(7, lp)
+	// 截短 payload
+	_, err := Decode(frameBytes[:len(frameBytes)-2])
+	if err == nil {
+		t.Fatal("expected length mismatch error")
+	}
+}
+
+func TestDecodeTooLarge(t *testing.T) {
+	// 手工构造声称超大 Length 的 header
+	buf := make([]byte, HeaderSize)
+	putHeader(buf, Header{Magic: Magic, Version: Version, Type: TypeData, Seq: 1, Length: uint32(MaxFrameLen)})
+	if _, err := ParseHeader(buf); err == nil {
+		t.Fatal("expected too large error")
+	}
+}
+
+func TestParseHeaderFields(t *testing.T) {
+	frameBytes, _ := EncodeData(12345678901234, []byte("x"))
+	h, err := ParseHeader(frameBytes[:HeaderSize])
+	if err != nil {
+		t.Fatalf("ParseHeader: %v", err)
+	}
+	if h.Magic != Magic || h.Version != Version || h.Type != TypeData || h.Seq != 12345678901234 {
+		t.Fatalf("bad header: %+v", h)
+	}
+	// 校验 CRC 与直接计算一致
+	if h.CRC != crc32.ChecksumIEEE(frameBytes[HeaderSize:]) {
+		t.Fatal("crc mismatch")
+	}
+}
+
+func TestEncodeHeartbeat(t *testing.T) {
+	fb, err := EncodeHeartbeat(42)
+	if err != nil {
+		t.Fatalf("EncodeHeartbeat: %v", err)
+	}
+	h, err := ParseHeader(fb[:HeaderSize])
+	if err != nil {
+		t.Fatalf("ParseHeader: %v", err)
+	}
+	if h.Type != TypeHeartbeat || h.Length != 0 || h.Seq != 42 {
+		t.Fatalf("bad heartbeat: %+v", h)
+	}
+	f, err := Decode(fb)
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if !f.IsHeartbeat() {
+		t.Fatal("expected heartbeat")
+	}
+}
+
+func TestEncodeTooLarge(t *testing.T) {
+	// 随机数据不可压缩，压缩后仍超限
+	big := make([]byte, MaxFrameLen*2)
+	if _, err := rand.Read(big); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := EncodeData(1, big); err == nil {
+		t.Fatal("expected too large error")
+	}
+}
