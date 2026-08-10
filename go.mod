@@ -1,6 +1,6 @@
 module influx-sync
 
-go 1.26.5
+go 1.22
 
 require (
 	go.uber.org/multierr v1.10.0 // indirect

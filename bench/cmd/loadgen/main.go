@@ -24,6 +24,7 @@ func main() {
 	workers := flag.Int("workers", 8, "concurrent write workers")
 	user := flag.String("user", "", "influx username")
 	pass := flag.String("pass", "", "influx password")
+	hxMode := flag.Bool("hx", false, "hx_migrate format: hisdb,attr_name,equament attr_value")
 	flag.Parse()
 
 	if *rate <= 0 || *duration <= 0 {
@@ -66,9 +67,20 @@ func main() {
 
 	// 预生成 tag 模板（避免每批重复拼接）
 	tagTpl := make([]string, 0, plants*pointsPerPlant)
-	for p := 1; p <= plants; p++ {
-		for pt := 1; pt <= pointsPerPlant; pt++ {
-			tagTpl = append(tagTpl, fmt.Sprintf("telemetry,plant=A%03d,point=P%04d", p, pt))
+	if *hxMode {
+		// hx 格式：attr_name 全局唯一（AI00001~AI03000, DI00001~DI97000）
+		for i := 1; i <= *rate; i++ {
+			name := fmt.Sprintf("AI%05d", i)
+			if i > 3000 {
+				name = fmt.Sprintf("DI%05d", i-3000)
+			}
+			tagTpl = append(tagTpl, fmt.Sprintf("hisdb,attr_name=%s,equament=HeQu", name))
+		}
+	} else {
+		for p := 1; p <= plants; p++ {
+			for pt := 1; pt <= pointsPerPlant; pt++ {
+				tagTpl = append(tagTpl, fmt.Sprintf("telemetry,plant=A%03d,point=P%04d", p, pt))
+			}
 		}
 	}
 
@@ -95,7 +107,11 @@ func main() {
 			for j, tpl := range tagTpl[i:end] {
 				val := float64(sec%100000) + 1000 // 可预测值
 				ts := secStart + int64(i+j)*step
-				lines = append(lines, fmt.Sprintf("%s value=%f,quality=1i %d", tpl, val, ts))
+				if *hxMode {
+					lines = append(lines, fmt.Sprintf("%s attr_value=%f %d", tpl, val, ts))
+				} else {
+					lines = append(lines, fmt.Sprintf("%s value=%f,quality=1i %d", tpl, val, ts))
+				}
 			}
 			total.Add(int64(len(lines)))
 			ch <- lines // 阻塞发送：worker 慢时自然背压
