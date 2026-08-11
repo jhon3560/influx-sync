@@ -90,8 +90,14 @@ type ReceiverConfig struct {
 	DLQ struct {
 		Dir string `yaml:"dir"` // 毒丸死信目录（空=禁用 DLQ，退回 0x00 重试）
 	} `yaml:"dlq"`
-	Monitor MonitorConfig `yaml:"monitor"`
-	Log     LogConfig     `yaml:"log"`
+	Relay struct {
+		Addr    string `yaml:"addr"`    // 中继目标地址（如 "198.51.100.x:28103"）；空=不启用中继
+		WALDir  string `yaml:"wal_dir"` // 转发 WAL 目录（重启不丢，必须配置）
+		Timeout string `yaml:"timeout"` // 转发读写超时
+	} `yaml:"relay"`
+	RelayWAL *wal.WAL      `yaml:"-"` // 转发 WAL 句柄（程序内注入，非配置文件）
+	Monitor  MonitorConfig `yaml:"monitor"`
+	Log      LogConfig     `yaml:"log"`
 }
 
 // LoadSender 加载 Sender 配置并应用环境变量覆盖。
@@ -309,5 +315,6 @@ func (c *ReceiverConfig) ReceiverConfig() receiver.Config {
 		LastSeqFile: c.Dedup.LastSeqFile,
 		DedupCap:    c.Dedup.Cap,
 		DLQDir:      c.DLQ.Dir,
+		RelayWAL:    c.RelayWAL, // 由 main 注入（需要 wal 包），nil=不启用中继
 	}
 }

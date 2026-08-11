@@ -14,13 +14,15 @@ import (
 	"influx-sync/internal/influx"
 	"influx-sync/internal/monitor"
 	"influx-sync/internal/protocol"
+	"influx-sync/internal/wal"
 )
 
 // Config Receiver 配置。
 type Config struct {
-	LastSeqFile string // last_seq 持久化路径（空=不持久化）
-	DedupCap    int    // LRU 容量
-	DLQDir      string // 毒丸死信目录（空=禁用 DLQ）
+	LastSeqFile string   // last_seq 持久化路径（空=不持久化）
+	DedupCap    int      // LRU 容量
+	DLQDir      string   // 毒丸死信目录（空=禁用 DLQ）
+	RelayWAL    *wal.WAL // 中继转发 WAL（V1.3；空=不启用中继）
 }
 
 // seqJumpLimit 允许的最大 seq 跳跃（防外部/异常帧污染 last_seq）。
@@ -135,6 +137,15 @@ func (r *Receiver) HandleFrame(connID uint64, frameBytes []byte) byte {
 		return protocol.AckFail // 可重试：不更新 last_seq，不确认；Sender 重发
 	}
 	r.metrics.IncWriteOk()
+
+	// V1.3 中继：写库成功的同时，原始 Line Protocol 写入转发 WAL（
+	// 由中继 Sender 发往下一跳；转发失败由 WAL 缓冲重试，不丢数据）。
+	// 注意：毒丸（写库失败进 DLQ）不转发，避免下游同样落 DLQ。
+	if r.cfg.RelayWAL != nil {
+		if _, err := r.cfg.RelayWAL.Append(f.Type, raw); err != nil {
+			r.logger.Error("relay wal append failed", zap.Uint64("seq", f.Seq), zap.Error(err))
+		}
+	}
 
 	// 写库成功后才推进 last_seq（顺序铁律）
 	r.advanceSeq(f.Seq)

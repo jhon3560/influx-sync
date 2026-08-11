@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -16,7 +17,9 @@ import (
 	"influx-sync/internal/logger"
 	"influx-sync/internal/monitor"
 	"influx-sync/internal/receiver"
+	"influx-sync/internal/sender"
 	"influx-sync/internal/transport"
+	"influx-sync/internal/wal"
 )
 
 func main() {
@@ -52,8 +55,27 @@ func run() error {
 		return err
 	}
 
-	// 帧处理器（校验/去重/写库/ACK）
+	// 监控指标（中继 Sender 与主链路共用）
 	metrics := monitor.New()
+
+	// V1.3 中继：配置 relay.addr 时，打开转发 WAL 并组装中继 Sender
+	var relaySenderLoop *sender.Sender
+	if cfg.Relay.Addr != "" {
+		relayWAL, err := wal.Open(cfg.Relay.WALDir, 64<<20)
+		if err != nil {
+			return fmt.Errorf("relay wal open %s: %w", cfg.Relay.WALDir, err)
+		}
+		cfg.RelayWAL = relayWAL
+		relayClient := transport.NewClient(transport.ClientConfig{
+			Addr:        cfg.Relay.Addr,
+			Timeout:     time.Second * 10,
+			DialTimeout: 10 * time.Second,
+		})
+		relaySenderLoop = sender.NewSender(relayWAL, relayClient, metrics, log, sender.SenderConfig{})
+		log.Info("relay enabled", zap.String("addr", cfg.Relay.Addr), zap.String("wal", cfg.Relay.WALDir))
+	}
+
+	// 帧处理器（校验/去重/写库/ACK）
 	handler, err := receiver.New(influxClient, metrics, log, cfg.ReceiverConfig())
 	if err != nil {
 		return err
@@ -70,6 +92,11 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go srv.Serve(ctx)
+
+	// V1.3 中继 Sender 循环（转发 WAL → 下一跳）
+	if relaySenderLoop != nil {
+		go relaySenderLoop.Run(ctx)
+	}
 
 	// 指标 HTTP 服务
 	metricsSrv := metrics.NewHTTPServer(cfg.Monitor.Addr, cfg.Monitor.Auth())
