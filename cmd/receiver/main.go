@@ -114,7 +114,9 @@ func run() error {
 	log.Info("shutting down", zap.String("signal", s.String()))
 	cancel()
 	srv.Close()
-	metricsSrv.Shutdown(context.Background())
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutCancel()
+	metricsSrv.Shutdown(shutCtx)
 	log.Info("receiver stopped")
 	return nil
 }

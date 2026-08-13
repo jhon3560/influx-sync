@@ -3,9 +3,12 @@ package sender
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -62,7 +65,7 @@ type Poller struct {
 
 	signalCh        chan struct{} // 订阅信号（cap=1，合并语义：忙时丢弃新信号）
 	lastPoll        time.Time     // 上次查询时间（最小信号间隔护栏）
-	wakeupScheduled bool          // watermark 解锁自唤醒定时器是否已安排（防重复）
+	wakeupScheduled atomic.Bool   // watermark 解锁自唤醒定时器是否已安排（原子，防竞态）
 }
 
 // NewPoller 创建轮询器。
@@ -164,19 +167,23 @@ func (p *Poller) Run(ctx context.Context) {
 			p.metrics.IncPollSkip()
 			continue
 		case bpDegraded:
-			// 黄色降速：间隔拉长至 5s，Batch 减半
-			time.Sleep(5 * time.Second)
+			// 黄色降速：间隔拉长至 5s（不阻塞主循环，可响应退出信号）
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+			}
 		}
 
 		blocked := p.pollOnce(ctx)
 		p.lastPoll = time.Now()
 		// watermark 解锁自唤醒（仅信号模式）：本轮窗口被水位截断时，
 		// 安排 watermark 时长后自动再查一次，避免等待下一个 ticker 的闲置延迟
-		if blocked && !p.wakeupScheduled {
-			p.wakeupScheduled = true
+		if blocked && !p.wakeupScheduled.Load() {
+			p.wakeupScheduled.Store(true)
 			go func() {
 				time.Sleep(p.cfg.Watermark)
-				p.wakeupScheduled = false
+				p.wakeupScheduled.Store(false)
 				p.Notify()
 			}()
 		}
@@ -281,11 +288,16 @@ func (p *Poller) queryParallel(ctx context.Context, start, end int64) ([]model.P
 			results <- qr{idx, pts, err}
 		}(i, s, e)
 	}
+	// 收集全部结果后按段序（idx）归并，保证输出时间升序
+	resps := make([]qr, 0, n)
+	for i := 0; i < n; i++ {
+		resps = append(resps, <-results)
+	}
+	sort.Slice(resps, func(i, j int) bool { return resps[i].idx < resps[j].idx })
 	all := make([]model.Point, 0, (end-start)/1e6)
 	seen := make(map[string]struct{}, (end-start)/1e6)
 	var firstErr error
-	for i := 0; i < n; i++ {
-		r := <-results
+	for _, r := range resps {
 		if r.err != nil {
 			if firstErr == nil {
 				firstErr = r.err
@@ -318,6 +330,8 @@ func (p *Poller) effectiveBatchPoints() int {
 // appendFrames 将窗口数据按 BatchPoints 分帧写入 WAL。
 // 组帧（LinesToProtocol + gzip 编码）在 worker 池并行执行，
 // 帧字节按 seq 顺序落盘（顺序铁律不变）。
+// 单帧编码失败（压缩后超 1MB / 原始超 16MB）时按段减半拆批重试，
+// 避免大帧永久失败导致游标卡死。
 func (p *Poller) appendFrames(points []model.Point) error {
 	if len(points) == 0 {
 		return nil
@@ -325,6 +339,17 @@ func (p *Poller) appendFrames(points []model.Point) error {
 	batch := p.effectiveBatchPoints()
 	if batch <= 0 {
 		batch = p.cfg.BatchPoints
+	}
+	return p.appendBatch(points, batch)
+}
+
+// appendBatch 将 points 按 batch 分帧追加；编码失败且 batch>1 时对失败段减半重试。
+func (p *Poller) appendBatch(points []model.Point, batch int) error {
+	if len(points) == 0 {
+		return nil
+	}
+	if batch < 1 {
+		batch = 1
 	}
 	nFrames := (len(points) + batch - 1) / batch
 	baseSeq := p.wal.NextSeq()
@@ -383,6 +408,17 @@ func (p *Poller) appendFrames(points []model.Point) error {
 			return fmt.Errorf("frame %d missing", i)
 		}
 		if f.err != nil {
+			if batch > 1 && isFrameTooLarge(f.err) {
+				start := i * batch
+				endPt := start + batch
+				if endPt > len(points) {
+					endPt = len(points)
+				}
+				p.logger.Warn("frame too large, splitting batch",
+					zap.Int("batch", batch), zap.Int("points", endPt-start))
+				// 注意：i 之前的帧已落盘，递归只重试失败段（seq 从 NextSeq 继续）
+				return p.appendBatch(points[start:endPt], batch/2)
+			}
 			return f.err
 		}
 		if err := p.wal.AppendEncoded(protocol.TypeData, f.seq, f.data); err != nil {
@@ -390,4 +426,14 @@ func (p *Poller) appendFrames(points []model.Point) error {
 		}
 	}
 	return nil
+}
+
+// isFrameTooLarge 判断编码失败是否因帧超限（可拆批恢复）。
+func isFrameTooLarge(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, protocol.ErrTooLarge) ||
+		strings.Contains(err.Error(), "payload too large") ||
+		strings.Contains(err.Error(), "frame too large")
 }

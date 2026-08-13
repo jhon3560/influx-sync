@@ -62,9 +62,14 @@ func (c *Client) SendFrame(frameBytes []byte) error {
 		return fmt.Errorf("tcp: not connected")
 	}
 	c.conn.SetWriteDeadline(time.Now().Add(c.cfg.Timeout))
-	if _, err := c.conn.Write(frameBytes); err != nil {
-		c.closeLocked()
-		return fmt.Errorf("tcp: write: %w", err)
+	// 循环写全量：net.Conn.Write 可能部分写（大帧 1MB 时可能发生）
+	for written := 0; written < len(frameBytes); {
+		n, err := c.conn.Write(frameBytes[written:])
+		if err != nil {
+			c.closeLocked()
+			return fmt.Errorf("tcp: write: %w", err)
+		}
+		written += n
 	}
 	return nil
 }

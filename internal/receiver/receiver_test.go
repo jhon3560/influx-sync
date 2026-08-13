@@ -374,8 +374,9 @@ func TestMeasurementOf(t *testing.T) {
 	}
 }
 
-func TestSeqJumpTooLargeRejected(t *testing.T) {
-	// 大序号跳跃帧（如外部注入）不得污染 last_seq：回 0x00 且不写库
+func TestSeqJumpTooLargeAccepted(t *testing.T) {
+	// 大序号跳跃帧（如 last_seq 丢失后 sender WAL 仍有积压）：接受处理
+	// （Influx 幂等覆盖保证安全），拒绝会导致停等重发死锁
 	srv, writeCount, _ := fakeTarget(t, false)
 	r := newTestReceiver(t, srv, Config{})
 	// 先正常处理 seq=1
@@ -383,15 +384,15 @@ func TestSeqJumpTooLargeRejected(t *testing.T) {
 	if ack := r.HandleFrame(1, fb1); ack != protocol.AckSuccess {
 		t.Fatalf("ack=%x", ack)
 	}
-	// 跳跃 100 万
+	// 跳跃 100 万：接受（幂等覆盖），推进 last_seq
 	fbBig, _ := protocol.EncodeData(1_000_001, []byte("m value=2 2"))
-	if ack := r.HandleFrame(1, fbBig); ack != protocol.AckFail {
-		t.Fatalf("big jump must be rejected, got %x", ack)
+	if ack := r.HandleFrame(1, fbBig); ack != protocol.AckSuccess {
+		t.Fatalf("big jump must be accepted, got %x", ack)
 	}
-	if r.LastSeq() != 1 {
-		t.Fatalf("last_seq polluted: %d", r.LastSeq())
+	if r.LastSeq() != 1_000_001 {
+		t.Fatalf("last_seq should advance: %d", r.LastSeq())
 	}
-	if writeCount.Load() != 1 {
+	if writeCount.Load() != 2 {
 		t.Fatalf("write count=%d", writeCount.Load())
 	}
 }

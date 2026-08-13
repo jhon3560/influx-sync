@@ -119,7 +119,9 @@ func run() error {
 	s := <-sig
 	log.Info("shutting down", zap.String("signal", s.String()))
 	cancel()
-	metricsSrv.Shutdown(context.Background())
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutCancel()
+	metricsSrv.Shutdown(shutCtx)
 	client.Close()
 	log.Info("sender stopped")
 	return nil

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -29,7 +30,7 @@ type Config struct {
 const seqJumpLimit uint64 = 100000
 
 // Receiver 帧处理器：Decode → 去重 → 写 Influx → ACK。
-// 依据协议：写库成功后才回 0xff，保证"ACK = 已落库"。
+// 依据协议：写库成功后才回 0xff，保证“ACK = 已落库”。
 type Receiver struct {
 	client  *influx.Client
 	dedup   *LRU
@@ -37,6 +38,9 @@ type Receiver struct {
 	logger  *zap.Logger
 	cfg     Config
 	lastSeq atomic.Int64 // 已成功处理的最大 seq（内存）
+
+	persistMu sync.Mutex
+	persistAt time.Time // last_seq 持久化节流（每秒最多一次）
 }
 
 // New 创建 Receiver。
@@ -79,14 +83,16 @@ func (r *Receiver) HandleFrame(connID uint64, frameBytes []byte) byte {
 		return protocol.AckSuccess
 	}
 
-	// seq 跳跃告警（不中断：Influx 覆盖保证最终一致）；过大跳跃视为异常帧拒绝
+	// seq 跳跃告警但不拒绝：Influx 幂等覆盖保证最终一致，
+	// 拒绝会导致 Sender 停等重发同一帧、链路永久卡死（如 last_seq 文件被
+	// 清理后重启，Sender WAL 仍有高位 seq 积压的场景）。
 	if f.Seq > uint64(r.lastSeq.Load())+1 {
 		if f.Seq > uint64(r.lastSeq.Load())+seqJumpLimit {
-			r.logger.Error("seq jump too large, frame rejected",
+			r.logger.Error("seq jump too large, frame accepted anyway (idempotent overwrite)",
 				zap.Uint64("seq", f.Seq), zap.Int64("last_seq", r.lastSeq.Load()))
-			return protocol.AckFail
+		} else {
+			r.logger.Warn("seq jump", zap.Uint64("seq", f.Seq), zap.Int64("last_seq", r.lastSeq.Load()))
 		}
-		r.logger.Warn("seq jump", zap.Uint64("seq", f.Seq), zap.Int64("last_seq", r.lastSeq.Load()))
 	}
 
 	raw, err := f.Decompress()
@@ -100,7 +106,13 @@ func (r *Receiver) HandleFrame(connID uint64, frameBytes []byte) byte {
 		return protocol.AckFail
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// 写库超时按批大小动态调整（基础 10s + 每行 1ms，封顶 120s）——
+	// 固定 30s 在大 batch 高压写库时可能超时导致假失败重发。
+	timeout := 10*time.Second + time.Duration(len(lines))*time.Millisecond
+	if timeout > 120*time.Second {
+		timeout = 120 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	if err := r.client.WriteLines(ctx, lines); err != nil {
 		r.metrics.IncWriteFail()
@@ -153,14 +165,24 @@ func (r *Receiver) HandleFrame(connID uint64, frameBytes []byte) byte {
 	return protocol.AckSuccess
 }
 
-// advanceSeq 推进 last_seq（内存 + 持久化）。
+// advanceSeq 推进 last_seq（内存 + 节流持久化）。
+// 持久化节流为每秒最多一次：崩溃窗口内丢失的推进由 Sender 重发 + Influx
+// 幂等覆盖兜底（At-Least-Once 不受影响）。
 func (r *Receiver) advanceSeq(seq uint64) {
 	r.lastSeq.Store(int64(seq))
-	if r.cfg.LastSeqFile != "" {
-		if err := saveLastSeq(r.cfg.LastSeqFile, int64(seq)); err != nil {
-			// 持久化失败不阻断：重启后重复帧由 Influx 幂等覆盖 / DLQ 幂等去重
-			r.logger.Warn("persist last_seq failed", zap.Uint64("seq", seq), zap.Error(err))
-		}
+	if r.cfg.LastSeqFile == "" {
+		return
+	}
+	r.persistMu.Lock()
+	defer r.persistMu.Unlock()
+	now := time.Now()
+	if now.Before(r.persistAt) {
+		return
+	}
+	r.persistAt = now.Add(time.Second)
+	if err := saveLastSeq(r.cfg.LastSeqFile, int64(seq)); err != nil {
+		// 持久化失败不阻断：重启后重复帧由 Influx 幂等覆盖 / DLQ 幂等去重
+		r.logger.Warn("persist last_seq failed", zap.Uint64("seq", seq), zap.Error(err))
 	}
 }
 

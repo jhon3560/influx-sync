@@ -5,14 +5,12 @@ import (
 	"crypto/hmac"
 	"fmt"
 	"net/http"
-	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// Metrics 指标集合（线程安全）。
+// Metrics 指标集合（线程安全，全 atomic）。
 type Metrics struct {
-	mu         sync.Mutex
 	cursor     atomic.Int64  // sync_cursor：当前逻辑游标（ns）
 	walPending atomic.Int64  // wal_pending：未确认帧数
 	walBytes   atomic.Int64  // wal_size_bytes

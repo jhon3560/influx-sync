@@ -29,14 +29,14 @@ func Encode(typ uint8, seq uint64, payload []byte) ([]byte, error) {
 		}
 		return encodeRaw(typ, seq, nil, 0), nil
 	}
+	// 压缩前先校验原始大小（V1.2.2）：防止 payload 超过解压上限被截断
+	if len(payload) > MaxDecompressedLen {
+		return nil, fmt.Errorf("protocol: payload too large: %d bytes (max %d), reduce batch_points", len(payload), MaxDecompressedLen)
+	}
 	var buf bytes.Buffer
 	zw, err := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
 	if err != nil {
 		return nil, fmt.Errorf("protocol: gzip init: %w", err)
-	}
-	// 压缩前校验原始大小（V1.2.2）：防止 payload 超过解压上限被截断
-	if len(payload) > MaxDecompressedLen {
-		return nil, fmt.Errorf("protocol: payload too large: %d bytes (max %d), reduce batch_points", len(payload), MaxDecompressedLen)
 	}
 	if _, err := zw.Write(payload); err != nil {
 		return nil, fmt.Errorf("protocol: gzip write: %w", err)
@@ -130,15 +130,21 @@ func Decode(frameBytes []byte) (Frame, error) {
 // Decompress 解压 Payload 为原始 Line Protocol 文本。
 // 解压上限为 MaxDecompressedLen（16MB），独立于压缩帧上限（1MB）——
 // 防止压缩后 ≤1MB 但原始数据 >1MB 的帧被截断（V1.2.2 修复）。
+// 超限时返回错误而非静默截断（截断会破坏最后一行的完整性）。
 func (f *Frame) Decompress() ([]byte, error) {
 	zr, err := gzip.NewReader(bytes.NewReader(f.Payload))
 	if err != nil {
 		return nil, fmt.Errorf("protocol: gzip open: %w", err)
 	}
 	defer zr.Close()
-	out, err := io.ReadAll(io.LimitReader(zr, int64(MaxDecompressedLen)))
+	// 多读 1 字节检测截断：读满上限后仍有数据 = 超限
+	lr := &io.LimitedReader{R: zr, N: int64(MaxDecompressedLen) + 1}
+	out, err := io.ReadAll(lr)
 	if err != nil {
 		return nil, fmt.Errorf("protocol: gzip read: %w", err)
+	}
+	if len(out) > MaxDecompressedLen {
+		return nil, fmt.Errorf("protocol: decompressed payload exceeds %d bytes", MaxDecompressedLen)
 	}
 	return out, nil
 }

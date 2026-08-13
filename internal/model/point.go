@@ -2,7 +2,9 @@
 package model
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 )
@@ -75,6 +77,10 @@ func (p *Point) LineProtocol() (string, error) {
 	sb.WriteByte(' ')
 	first := true
 	for _, k := range fieldKeys {
+		// NaN/Inf 字段跳过（InfluxDB 拒绝 NaN，写入会整帧 400 成毒丸）
+		if isNaNOrInf(p.Fields[k]) {
+			continue
+		}
 		if !first {
 			sb.WriteByte(',')
 		}
@@ -85,23 +91,42 @@ func (p *Point) LineProtocol() (string, error) {
 			return "", fmt.Errorf("field %q: %w", k, err)
 		}
 	}
+	if first {
+		// 所有字段都是 NaN/Inf：整点跳过（无可用字段）
+		return "", errSkipPoint
+	}
 
 	sb.WriteByte(' ')
 	sb.WriteString(fmt.Sprintf("%d", p.Timestamp))
 	return sb.String(), nil
 }
 
-// LinesToProtocol 批量转换，任一失败即返回错误（整体失败，便于 WAL 重试）。
+// LinesToProtocol 批量转换；全 NaN 点跳过，其余失败即返回错误（便于 WAL 重试）。
 func LinesToProtocol(points []Point) ([]string, error) {
 	lines := make([]string, 0, len(points))
 	for i := range points {
 		line, err := points[i].LineProtocol()
 		if err != nil {
+			if errors.Is(err, errSkipPoint) {
+				continue // 全 NaN 点：跳过
+			}
 			return nil, fmt.Errorf("point[%d]: %w", i, err)
 		}
 		lines = append(lines, line)
 	}
 	return lines, nil
+}
+
+// errSkipPoint 标记整点应被跳过（所有字段均 NaN/Inf）。
+var errSkipPoint = errors.New("point skipped: all fields NaN/Inf")
+
+// isNaNOrInf 判断 float 值是否为 NaN/±Inf（InfluxDB 拒绝此类值）。
+func isNaNOrInf(v interface{}) bool {
+	f, ok := v.(float64)
+	if !ok {
+		return false
+	}
+	return math.IsNaN(f) || math.IsInf(f, 0)
 }
 
 func escapeMeasurement(s string) string {
@@ -117,14 +142,18 @@ func escapeTag(s string) string {
 func writeFieldValue(sb *strings.Builder, v interface{}) error {
 	switch t := v.(type) {
 	case float64:
+		if math.IsNaN(t) || math.IsInf(t, 0) {
+			return fmt.Errorf("NaN/Inf float field")
+		}
 		sb.WriteString(fmt.Sprintf("%v", t))
 	case int64:
 		sb.WriteString(fmt.Sprintf("%di", t))
 	case int:
 		sb.WriteString(fmt.Sprintf("%di", t))
 	case string:
+		// line protocol 字符串：转义反斜杠与双引号（否则破坏行解析）
 		sb.WriteByte('"')
-		sb.WriteString(strings.NewReplacer(`"`, `\"`).Replace(t))
+		sb.WriteString(strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(t))
 		sb.WriteByte('"')
 	case bool:
 		if t {

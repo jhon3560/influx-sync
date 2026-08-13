@@ -229,7 +229,8 @@ func TestCursorPersistAndRegress(t *testing.T) {
 
 func TestMoveToDLQ(t *testing.T) {
 	w := newTestWAL(t, 0)
-	seq, _ := w.Append(protocol.TypeData, []byte("m value=1 1"))
+	payload := []byte("m value=1 1")
+	seq, _ := w.Append(protocol.TypeData, payload)
 	if err := w.MoveToDLQ(seq, "field type conflict"); err != nil {
 		t.Fatalf("MoveToDLQ: %v", err)
 	}
@@ -241,6 +242,25 @@ func TestMoveToDLQ(t *testing.T) {
 	framePath := filepath.Join(dlqDir, fmt.Sprintf("seq-%020d.frame", seq))
 	if _, err := os.Stat(framePath); err != nil {
 		t.Fatalf("dlq frame missing: %v", err)
+	}
+	// 帧内容必须可完整解析（回归：曾因读取偏移漏加 recordHeadLen 错位 4 字节）
+	fb, err := os.ReadFile(framePath)
+	if err != nil {
+		t.Fatalf("read dlq frame: %v", err)
+	}
+	f, err := protocol.Decode(fb)
+	if err != nil {
+		t.Fatalf("dlq frame not decodable (offset bug?): %v", err)
+	}
+	if f.Seq != seq {
+		t.Fatalf("dlq frame seq=%d want %d", f.Seq, seq)
+	}
+	raw, err := f.Decompress()
+	if err != nil {
+		t.Fatalf("dlq frame decompress: %v", err)
+	}
+	if !bytes.Equal(raw, payload) {
+		t.Fatalf("dlq payload mismatch: %q vs %q", raw, payload)
 	}
 	metaPath := filepath.Join(dlqDir, fmt.Sprintf("seq-%020d.txt", seq))
 	meta, err := os.ReadFile(metaPath)

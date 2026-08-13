@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"influx-sync/internal/influx"
+	"influx-sync/internal/model"
 	"influx-sync/internal/monitor"
 	"influx-sync/internal/protocol"
 	"influx-sync/internal/transport"
@@ -325,5 +326,57 @@ func TestBackoff(t *testing.T) {
 		if got := s.backoff(c.n); got != c.want {
 			t.Fatalf("backoff(%d)=%v want %v", c.n, got, c.want)
 		}
+	}
+}
+
+// TestIsFrameTooLarge 验证拆批判定：超限错误可识别，普通错误不可拆。
+func TestIsFrameTooLarge(t *testing.T) {
+	if !isFrameTooLarge(protocol.ErrTooLarge) {
+		t.Fatal("ErrTooLarge should be recognized")
+	}
+	if !isFrameTooLarge(fmt.Errorf("protocol: payload too large: 999 bytes")) {
+		t.Fatal("payload too large should be recognized")
+	}
+	if !isFrameTooLarge(fmt.Errorf("protocol: frame too large: 999 bytes")) {
+		t.Fatal("frame too large should be recognized")
+	}
+	if isFrameTooLarge(fmt.Errorf("some other error")) {
+		t.Fatal("ordinary error must not trigger split")
+	}
+	if isFrameTooLarge(nil) {
+		t.Fatal("nil must not trigger split")
+	}
+}
+
+// TestAppendBatchSplitsOnTooLarge 验证超限帧自动拆批不卡死、不 panic。
+func TestAppendBatchSplitsOnTooLarge(t *testing.T) {
+	w, err := wal.Open(filepath.Join(t.TempDir(), "wal"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	log := testLogger(t)
+	metrics := monitor.New()
+	p := &Poller{wal: w, metrics: metrics, logger: log, cfg: PollerConfig{BatchPoints: 100, ParallelQueries: 2}}
+	// 单个点 17MB 字段值（> MaxDecompressedLen 16MB）：任何批量下编码必失败，
+	// 拆批应终止于错误返回（不卡死、不 panic，游标由上层保持）。
+	big := strings.Repeat("x", 17<<20)
+	pts := make([]model.Point, 4)
+	for i := range pts {
+		pts[i] = model.Point{Measurement: "m", Fields: map[string]interface{}{"v": big}, Timestamp: int64(i + 1)}
+	}
+	if err := p.appendBatch(pts, 100); err == nil {
+		t.Fatal("expected too-large error even after split")
+	}
+	// 回归验证：可编码的数据正常落盘
+	ok := []model.Point{
+		{Measurement: "m", Fields: map[string]interface{}{"v": "a"}, Timestamp: 1},
+		{Measurement: "m", Fields: map[string]interface{}{"v": "b"}, Timestamp: 2},
+	}
+	if err := p.appendBatch(ok, 100); err != nil {
+		t.Fatalf("appendBatch ok data: %v", err)
+	}
+	if w.PendingCount() != 1 {
+		t.Fatalf("pending=%d", w.PendingCount())
 	}
 }

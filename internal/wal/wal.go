@@ -503,7 +503,8 @@ func (w *WAL) MoveToDLQ(seq uint64, reason string) error {
 	if err != nil {
 		return fmt.Errorf("wal: open seg for dlq: %w", err)
 	}
-	if _, err := f.ReadAt(frameBytes, fi.offset); err != nil {
+	// fi.offset 是 [u32 len] 记录头起点，帧字节在 offset+recordHeadLen 处
+	if _, err := f.ReadAt(frameBytes, fi.offset+recordHeadLen); err != nil {
 		f.Close()
 		return fmt.Errorf("wal: read frame for dlq: %w", err)
 	}

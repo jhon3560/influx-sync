@@ -2,6 +2,7 @@
 package influx
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -194,7 +195,11 @@ func (c *Client) queryOnce(ctx context.Context, start, end int64, opt QueryOptio
 		return nil, fmt.Errorf("influx: query http %d: %s", resp.StatusCode, truncate(string(body), 512))
 	}
 	var qr queryResult
-	if err := json.Unmarshal(body, &qr); err != nil {
+	// UseNumber：时间戳（epoch=ns）超出 float64 精确范围（2^53），
+	// 用 json.Number 保留纳秒精度（否则 ±256ns 误差）
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	if err := dec.Decode(&qr); err != nil {
 		return nil, fmt.Errorf("influx: parse query response: %w", err)
 	}
 	if qr.Err != "" {
@@ -284,7 +289,9 @@ func (c *Client) queryMeta(ctx context.Context, q string) ([][]interface{}, erro
 		return nil, fmt.Errorf("http %d", resp.StatusCode)
 	}
 	var qr queryResult
-	if err := json.Unmarshal(body, &qr); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	if err := dec.Decode(&qr); err != nil {
 		return nil, err
 	}
 	if qr.Err != "" {
@@ -351,7 +358,7 @@ func seriesToPoints(name string, columns []string, values [][]interface{}, schem
 		if len(row) != len(columns) {
 			return nil, fmt.Errorf("row/column mismatch: %d vs %d", len(row), len(columns))
 		}
-		ts, ok := row[timeIdx].(float64)
+		ts, ok := tsToInt64(row[timeIdx])
 		if !ok {
 			return nil, fmt.Errorf("bad timestamp %v", row[timeIdx])
 		}
@@ -387,6 +394,13 @@ func seriesToPoints(name string, columns []string, values [][]interface{}, schem
 			}
 			// 3. 兜底：按 JSON 值类型
 			switch v := row[i].(type) {
+			case json.Number:
+				// 整数语义优先（时间戳/整数字段），否则 float
+				if iv, err := v.Int64(); err == nil {
+					p.Fields[col] = iv
+				} else if fv, err := v.Float64(); err == nil {
+					p.Fields[col] = fv
+				}
 			case float64:
 				p.Fields[col] = v
 			case bool:
@@ -406,12 +420,38 @@ func seriesToPoints(name string, columns []string, values [][]interface{}, schem
 	return points, nil
 }
 
+// tsToInt64 将 JSON 时间戳（json.Number 或 float64）转换为 int64 纳秒。
+func tsToInt64(v interface{}) (int64, bool) {
+	switch t := v.(type) {
+	case json.Number:
+		n, err := t.Int64()
+		if err != nil {
+			f, ferr := t.Float64()
+			if ferr != nil {
+				return 0, false
+			}
+			return int64(f), true
+		}
+		return n, true
+	case float64:
+		return int64(t), true
+	}
+	return 0, false
+}
+
 func toInt64(v interface{}) int64 {
 	switch t := v.(type) {
 	case float64:
 		return int64(t)
 	case int64:
 		return t
+	case json.Number:
+		n, err := t.Int64()
+		if err == nil {
+			return n
+		}
+		f, _ := t.Float64()
+		return int64(f)
 	}
 	return 0
 }
@@ -422,6 +462,9 @@ func toFloat64(v interface{}) float64 {
 		return t
 	case int64:
 		return float64(t)
+	case json.Number:
+		f, _ := t.Float64()
+		return f
 	}
 	return 0
 }

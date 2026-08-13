@@ -1,7 +1,9 @@
 package model
 
 import (
+	"math"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -99,4 +101,52 @@ func TestLinesToProtocol(t *testing.T) {
 		t.Fatalf("got %d lines", len(lines))
 	}
 	_ = reflect.DeepEqual // keep import if unused later
+}
+
+func TestNaNInfFieldsSkipped(t *testing.T) {
+	// NaN/Inf 字段跳过，其余字段保留（防整帧 400 毒丸）
+	p := Point{Measurement: "m", Tags: map[string]string{}, Fields: map[string]interface{}{
+		"v":  math.NaN(),
+		"ok": 1.5,
+	}, Timestamp: 100}
+	line, err := p.LineProtocol()
+	if err != nil {
+		t.Fatalf("line: %v", err)
+	}
+	if !strings.Contains(line, "ok=1.5") {
+		t.Fatalf("ok field missing: %q", line)
+	}
+	if strings.Contains(line, "v=") {
+		t.Fatalf("NaN field should be skipped: %q", line)
+	}
+}
+
+func TestAllNaNPointSkipped(t *testing.T) {
+	// 全 NaN 点：整点跳过，不影响批内其他点
+	pts := []Point{
+		{Measurement: "m", Fields: map[string]interface{}{"v": math.NaN()}, Timestamp: 1},
+		{Measurement: "m", Fields: map[string]interface{}{"v": 2.0}, Timestamp: 2},
+	}
+	lines, err := LinesToProtocol(pts)
+	if err != nil {
+		t.Fatalf("lines: %v", err)
+	}
+	if len(lines) != 1 || !strings.Contains(lines[0], "v=2") {
+		t.Fatalf("lines=%v", lines)
+	}
+}
+
+func TestStringFieldBackslashEscaped(t *testing.T) {
+	// 字符串字段中的反斜杠与引号必须转义（否则破坏 line protocol 解析）
+	p := Point{Measurement: "m", Fields: map[string]interface{}{
+		"s": `path\dir "quoted"`,
+	}, Timestamp: 100}
+	line, err := p.LineProtocol()
+	if err != nil {
+		t.Fatalf("line: %v", err)
+	}
+	want := `s="path\\dir \"quoted\""`
+	if !strings.Contains(line, want) {
+		t.Fatalf("escape mismatch:\n got %q\nwant contains %q", line, want)
+	}
 }

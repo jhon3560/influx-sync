@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/rand"
 	"hash/crc32"
 	"strings"
@@ -117,5 +118,27 @@ func TestEncodeTooLarge(t *testing.T) {
 	}
 	if _, err := EncodeData(1, big); err == nil {
 		t.Fatal("expected too large error")
+	}
+}
+
+func TestDecompressTooLargeRejected(t *testing.T) {
+	// 解压后超过 MaxDecompressedLen 的帧：必须报错而非静默截断
+	//（截断会破坏最后一行的完整性，产生数据损坏）
+	var buf bytes.Buffer
+	zw, _ := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+	big := bytes.Repeat([]byte("a"), MaxDecompressedLen+1024)
+	if _, err := zw.Write(big); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fb := encodeRaw(TypeData, 1, buf.Bytes(), crc32.ChecksumIEEE(buf.Bytes()))
+	f, err := Decode(fb)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, err := f.Decompress(); err == nil {
+		t.Fatal("expected decompress too-large error, got nil (silent truncation)")
 	}
 }
