@@ -8,8 +8,9 @@
 |---|---|
 | 源码 | WSL `~/influx-sync-src`（git 管理） |
 | 当前版本 | V1.4.3（tag v1.4.3，分支 feature/audit-fixes） |
-| 版本体系 | v1.0(master) → v1.1(feature/parallel) → v1.2~v1.2.3(feature/signal-trigger) → v1.3+中继 → v1.3.1(审计修复) → v1.4.0(性能审计修复) → v1.4.1(滑窗缺陷复审 N1-N5) → v1.4.3(复审 N6-N8)；每版本打 tag，二进制保留 .bak |
+| 版本体系 | v1.0(master) → v1.1(feature/parallel) → v1.2~v1.2.3(feature/signal-trigger) → v1.3+中继 → v1.3.1(审计修复) → v1.4.0(性能审计修复) → v1.4.1(滑窗缺陷复审 N1-N5) → v1.4.2(复审 N6-N8) → v1.4.3(收尾加固)；每版本打 tag，二进制保留 .bak |
 | 构建 | `CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/sender ./cmd/sender`（麒麟 V10 glibc 2.28 必须静态） |
+| 发布流程 | **先 commit+tag，确认工作树干净后再构建**（在仓库外目录构建再拷回 bin/），保证 `go version -m` 的 vcs.revision=tag 且 vcs.modified=false；发布包需含 SHA256SUMS |
 | 测试 | `go test ./...`；`go test -race ./internal/...`；交付前两者都过 |
 | 压测工具 | bench/loadgen：`-hx` 格式(hisdb 表) 与 telemetry 格式；`-rate/-duration/-workers/-batch/-url/-db/-user/-pass` |
 
@@ -74,6 +75,9 @@
 | 报告原则 | 文档不体现源码对比、不体现版本迭代过程、无倾向性，只列测试数据；交付 Word 版 |
 | 测试规范 | 不模拟数据库重启（只测正常工况）；每档清库独立验证；压测中观察（延迟/读取错误率每 5s 采样）；验证用 influx CLI（curl 高压有 count bug） |
 | 兼容红线 | At-Least-Once 永不丢弃数据帧（AckFail 只重试）；协议 Version=1 不变 |
+| 滑窗（pipeline_window） | 默认 1=停等；开启前必须过 docs/pipeline-validation.md 装置验证 |
+| seq 语义 | 数据帧从 1 开始（0 保留给心跳）；last_seq 连续前缀推进；重启缺口由新连接首帧闭合 |
+| 文档维护 | 改动机制/配置/指标后同步更新 docs/（architecture/protocol/configuration/operations 四件套） |
 
 ## 5. 用户工作偏好（务必遵守）
 

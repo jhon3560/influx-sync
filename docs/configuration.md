@@ -139,3 +139,36 @@ query_limit=500000、poller_parallel=4、WAL 64MB、monitor :28080。
   共用会损坏数据
 - **InfluxDB 侧**（128G 内存环境）：tsi1 索引、max-values-per-tag=0、cache-max-memory=20g、
   snapshot=1g、压缩并发 16、wal-fsync-delay=1s
+
+## 6. 默认值总表
+
+| 配置项 | 默认值 | 生效位置 |
+|---|---|---|
+| source/target.timeout | 10s | influx HTTP 兜底（查询按窗口动态 30s+2×窗口，10min 封顶；写库 10s+1ms/行，120s 封顶） |
+| sync.interval | 1s | 轮询周期 |
+| sync.window | 5s | 查询窗口 |
+| sync.watermark | 10s | 水位延迟 |
+| sync.max_window | 30s | 单轮窗口上限 |
+| sync.batch_points | 10000 | 单帧点数 |
+| sync.query_limit | 100000 | 单次查询 LIMIT |
+| sync.poller_parallel | 4（≤1 视为 4） | 并行 worker 数 |
+| sync.signal_min_interval | 200ms | 信号最小间隔 |
+| sync.backfill | 0 | 首次回填 |
+| wal.segment_size | 64MB | 段大小 |
+| tcp.timeout / dial_timeout | 10s | sender TCP 读写/拨号 |
+| tcp.read_timeout | 60s | receiver 读帧超时 |
+| tcp.max_inflight | 8（≤0 视为 8） | receiver 并发写库窗口 |
+| tcp.max_conns | 0（不限制） | receiver 最大连接数 |
+| sender.max_retry | 10 | 连续失败告警阈值（不丢弃） |
+| sender.backoff_base / backoff_max | 1s / 60s | 退避 |
+| sender.heartbeat_interval | 30s | 空闲心跳 |
+| sender.pipeline_window | 1（停等） | 滑窗（实验项，需装置验证） |
+| sender.idle_sleep | 200ms（内部常量） | 空闲兜底轮询（WAL 通知失效时） |
+| log.level | info | 日志级别 |
+| log.max_mb / max_backups | 100 / 10 | 轮转 |
+| relay.timeout | 10s | 中继读写超时 |
+| relay.dlq_dir | `<wal_dir>/../relay_dlq` | 中继失败转存 |
+
+运行时常量（不可配）：WAL checkpoint 节流 1s；last_seq 持久化节流 1s；DLQ 容量 1GB
+（sender 侧）；帧压缩上限 1MB / 解压上限 16MB；seq 大跳跃阈值 100000；schema 缓存
+1h（降级 30s）；心跳 seq=0；数据 seq 从 1 开始。

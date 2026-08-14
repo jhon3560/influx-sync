@@ -9,11 +9,12 @@ InfluxDB 跨正向隔离同步系统（ISFP 协议，V1.4.3）。
 
 | 能力 | 说明 |
 |---|---|
-| 数据获取 | 时间窗口轮询 + 订阅信号事件驱动（可选），游标 + WAL 缓冲，支持历史回填 |
-| 传输 | ISFP：20B 头 + gzip(Line Protocol) + CRC32；停等协议（适配隔离装置单字节 ACK 0xff/0x00） |
-| 可靠性 | WAL 落盘 + 停等 ACK + seq 去重 + 断点续传 + DLQ 毒丸隔离 + 反压保护（三级水位） |
+| 数据获取 | 时间窗口轮询 + 订阅信号事件驱动（信号不丢弃、延迟触发），游标 + WAL 缓冲，支持历史回填 |
+| 传输 | ISFP：20B 头 + gzip(Line Protocol) + CRC32；停等协议（适配隔离装置单字节 ACK）；滑窗（实验项，需装置验证） |
+| 可靠性 | WAL group commit + 停等 ACK + last_seq 连续前缀去重 + 断点续传 + DLQ 毒丸隔离 + 中继 DLQ + 反压三级水位 + WAL 撕裂尾自恢复 |
+| 性能（V1.4） | 组帧 60x CPU（544ns/点）、边界去重零全窗口 map、checkpoint 节流、并发写库+按序 ACK、schema single-flight |
 | 中继（V1.3） | Receiver 落盘同时转发下一跳（relay 配置，复用 Sender，At-Least-Once） |
-| 监控 | /metrics（Prometheus 格式：游标/延迟/积压/重试/DLQ/反压） |
+| 监控 | /metrics（Prometheus：游标/端到端延迟/积压/重试/在途帧/DLQ/反压） |
 | 带宽 | gzip 约 19x：5 万点/s 实测 2.5Mbps（对比明文方案 47.8Mbps） |
 
 ## 版本记录
@@ -39,13 +40,13 @@ InfluxDB 跨正向隔离同步系统（ISFP 协议，V1.4.3）。
 cmd/sender        发送端入口（I 区）
 cmd/receiver      接收端入口（III 区）
 internal/protocol ISFP 帧编解码
-internal/transport TCP 停等客户端/服务端
-internal/wal      分段 WAL（64MB/段 + checkpoint + DLQ）
-internal/sender    Poller（查询/信号/组帧）+ Sender（停等发送）+ SignalListener
-internal/receiver 帧处理（去重/写库/中继）
+internal/transport TCP 停等客户端 / 流水线服务端（并发写库 + 按序 ACK）
+internal/wal      分段 WAL（group commit + checkpoint 节流 + 撕裂尾恢复）
+internal/sender   Poller（查询/信号/组帧）+ Sender（停等/滑窗发送）+ SignalListener
+internal/receiver 帧处理（连续前缀去重/缺口闭合/写库/中继）
 internal/influx   InfluxDB 1.x HTTP 客户端（schema 自适应 + ns 精度）
 internal/monitor  Prometheus 指标
-internal/model    Point / Line Protocol 序列化
+internal/model    Point / Line Protocol 序列化（键序缓存 + strconv）
 bench/loadgen     压测工具（telemetry / -hx 两种格式）
 bench/poison      毒丸注入工具
 ```
@@ -53,7 +54,7 @@ bench/poison      毒丸注入工具
 ## 快速开始
 
 ```bash
-# 构建（麒麟 V10 需静态编译，glibc 2.28）
+# 构建（麒麟 V10 需静态编译，glibc 2.28；先 commit+tag 再构建，溯源戳才干净）
 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/sender ./cmd/sender
 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/receiver ./cmd/receiver
 
@@ -66,10 +67,12 @@ go test -race ./internal/...
 
 | 文档 | 内容 |
 |---|---|
-| [docs/architecture.md](docs/architecture.md) | 功能设计：架构/数据流/协议/可靠性机制 |
-| [docs/configuration.md](docs/configuration.md) | 参数配置详解 + 生产环境示例 |
-| [docs/deployment.md](docs/deployment.md) | 部署：安装/systemd/双实例/防火墙/升级 |
-| [docs/operations.md](docs/operations.md) | 运维：日志/指标/排障/备份/已知问题 |
+| [docs/architecture.md](docs/architecture.md) | 程序设计：架构/模块/数据结构/并发模型/核心机制/可靠性论证 |
+| [docs/protocol.md](docs/protocol.md) | ISFP 线协议规范：帧格式/ACK 语义/seq 规则/连接生命周期/兼容性 |
+| [docs/configuration.md](docs/configuration.md) | 参数配置详解 + 默认值总表 + 生产环境示例 |
+| [docs/deployment.md](docs/deployment.md) | 部署：安装包/systemd/升级回滚/防火墙/上架清单 |
+| [docs/operations.md](docs/operations.md) | 运维：日志/指标/排障/备份/例行检查 |
 | [docs/relay.md](docs/relay.md) | 中继功能（V1.3） |
-| [docs/audit-fixes-2026-08.md](docs/audit-fixes-2026-08.md) | 代码审计修复记录（V1.3.1 → V1.4.0） |
+| [docs/pipeline-validation.md](docs/pipeline-validation.md) | 滑窗隔离装置兼容性验证方案（未验证前保持默认关闭） |
+| [docs/audit-fixes-2026-08.md](docs/audit-fixes-2026-08.md) | 三轮审计修复记录（V1.3.1 → V1.4.3） |
 | [docs/AGENT.md](docs/AGENT.md) | 开发环境与上下文（设备/部署拓扑/决策/约束） |

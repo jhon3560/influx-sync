@@ -1,5 +1,8 @@
 # 部署手册
 
+> V1.4.3。安装包：`influx-sync-v1.4.3-linux-amd64.tar.gz`。
+> 配置说明见 [configuration.md](configuration.md)；协议见 [protocol.md](protocol.md)。
+
 ## 1. 安装布局
 
 ```
@@ -7,7 +10,8 @@
 ├── bin/
 │   ├── sender            # V1.4.3 静态二进制（CGO_ENABLED=0，兼容麒麟 V10 glibc 2.28）
 │   ├── receiver
-│   └── *.bak             # 历史版本备份（升级前 cp 保留）
+│   ├── loadgen           # 压测工具（可选）
+│   └── *.bak             # 历史版本备份（升级前保留；含 <新版本>.bak 双份）
 ├── conf/
 │   ├── sender-174.yaml / sender-175.yaml
 │   └── receiver-174.yaml / receiver-175.yaml
@@ -18,14 +22,47 @@
 专用系统用户：`influxsync`（useradd -r -M -s /sbin/nologin influxsync），
 `chown -R influxsync:influxsync /opt/influx-sync`。
 
-## 2. 构建与升级
+## 2. 首次安装（安装包）
 
 ```bash
-# 构建（开发机 WSL 或任意 Go 1.22 环境）
-CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/sender ./cmd/sender
-CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/receiver ./cmd/receiver
+# 1. 解包并安装
+tar xzf influx-sync-v1.4.3-linux-amd64.tar.gz -C /tmp
+cd /tmp/influx-sync-v1.4.3
+./upgrade.sh --no-restart          # 只安装二进制（首次无服务可重启）
 
-# 升级流程（每实例）
+# 2. 目录与服务账号
+mkdir -p /opt/influx-sync/{conf,data,logs}
+useradd -r -M -s /sbin/nologin influxsync || true
+chown -R influxsync:influxsync /opt/influx-sync
+
+# 3. 配置：按实例从示例复制改参
+cp conf/sender.example.yaml   /opt/influx-sync/conf/sender-174.yaml
+cp conf/receiver.example.yaml /opt/influx-sync/conf/receiver-174.yaml
+vi /opt/influx-sync/conf/*.yaml        # 必填项见 configuration.md
+
+# 4. systemd（包内模板，多实例用 %i 区分）
+cp systemd/influx-sync-sender@.service   /etc/systemd/system/
+cp systemd/influx-sync-receiver@.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now influx-sync-sender@174
+
+# 5. 验证
+tail -f /opt/influx-sync/logs/sender-174.log     # "sender started"
+curl -s http://127.0.0.1:28080/metrics | head
+go version -m /opt/influx-sync/bin/sender | grep vcs.revision   # 溯源戳=v1.4.3
+```
+
+## 3. 升级
+
+```bash
+# 安装包脚本升级（推荐）：备份 .bak → 装新二进制 → 重启全部 influx-sync-* 服务
+tar xzf influx-sync-v1.4.3-linux-amd64.tar.gz -C /tmp
+cd /tmp/influx-sync-v1.4.3 && ./upgrade.sh
+```
+
+手动升级（等价操作）：
+
+```bash
 cp /opt/influx-sync/bin/sender /opt/influx-sync/bin/sender.v<旧版本>.bak
 install -m 0755 sender /opt/influx-sync/bin/sender
 chown influxsync:influxsync /opt/influx-sync/bin/sender
@@ -33,30 +70,44 @@ systemctl restart influx-sync-sender-174
 # 验证：日志 "sender started"、/metrics、WAL 积压追平
 ```
 
-升级向后兼容：协议 Version=1 不变；WAL/checkpoint 格式兼容；新配置项均有默认值。
+**回滚**：`cp bin/sender.bak bin/sender && systemctl restart influx-sync-sender-174`。
 
-## 3. systemd 单元（示例）
+升级向后兼容：协议 Version=1 不变；WAL/checkpoint 格式兼容；新配置项均有默认值。
+两侧（sender/receiver）不要求同步升级，但建议配套升级以取得正确性修复。
+
+## 4. 源码构建（开发机）
+
+```bash
+# 麒麟 V10 glibc 2.28 必须静态编译；**先 commit+tag 再构建**，溯源戳才干净
+git tag v1.4.3 && git status --porcelain   # 确保工作树干净
+mkdir -p /tmp/out && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /tmp/out/sender ./cmd/sender
+CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /tmp/out/receiver ./cmd/receiver
+CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /tmp/out/loadgen ./bench/loadgen
+go version -m /tmp/out/sender | grep vcs   # vcs.modified 必须为 false
+```
+
+## 5. systemd 单元（包内模板，等价示例）
 
 ```ini
-# /etc/systemd/system/influx-sync-sender-174.service
+# /etc/systemd/system/influx-sync-sender@.service
 [Unit]
-Description=Influx Sync Sender - 174
+Description=Influx Sync Sender - %i
 After=network.target
 
 [Service]
 User=influxsync
-ExecStart=/opt/influx-sync/bin/sender -config /opt/influx-sync/conf/sender-174.yaml
+ExecStart=/opt/influx-sync/bin/sender -config /opt/influx-sync/conf/sender-%i.yaml
 Restart=always
 RestartSec=5
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-receiver 同构（ExecStart 换 receiver + 对应 yaml）。多实例=多个单元文件。
-`systemctl enable --now` 开机自启。
+receiver 同构。`systemctl enable --now influx-sync-sender@174` 即实例化 174。
 
-## 4. 生产拓扑（生产主站）
+## 6. 生产拓扑（生产主站）
 
 ```
 174(源Influx) ──订阅──> 103 sender-174 (18098信号) ──TP202--> 192.0.2.131:28101 ──隔离──> 171 receiver-174 (:28101) --> HXScada
@@ -69,8 +120,10 @@ receiver 同构（ExecStart 换 receiver + 对应 yaml）。多实例=多个单�
 - **虚地址**：103 tcp.addr 配 192.0.2.131（隔离装置前侧）；171 只监听本机
   （0.0.0.0），**不需要配置 198.51.100.180**
 - **运维地址 198.51.100.x 不应出现在任何配置里**（测试临时网段）
+- 中继部署：B 机 receiver 加 `relay` 段（addr=下一跳、wal_dir 必配）；C 机标准
+  receiver 无改动。详见 [relay.md](relay.md)
 
-## 5. 防火墙
+## 7. 防火墙
 
 ```bash
 # 103（订阅信号入站）
@@ -81,16 +134,13 @@ firewall-cmd --reload
 # 出站默认放行（sender 连对端不需规则）；严格模式需另加出站 rich rule
 ```
 
-## 6. 中继部署（可选，V1.3）
-
-B 机 receiver 加 `relay` 段（addr=下一跳、wal_dir 必配）；C 机标准 receiver 无改动。
-B 需能出站连 C。详见 [relay.md](relay.md)。
-
-## 7. 上架检查清单
+## 8. 上架检查清单
 
 1. `ip link` 生产网卡 state UP；`ip route` 默认路由走生产网关
 2. 103→虚地址 `ping`/`nc -z 192.0.2.131 28101` 通
 3. 订阅创建且 `SHOW SUBSCRIPTIONS` 可见
-4. 启动 sender → 日志 `sender started` + `/metrics` 可查
-5. 写入 1 条测试数据 → 171 库 count 验证（用 influx CLI，勿用 curl count 高压 bug）
-6. `sync_delay_seconds` 稳定在 watermark+处理时间
+4. 二进制溯源 `go version -m bin/sender | grep vcs` 与版本一致
+5. 启动 sender → 日志 `sender started` + `/metrics` 可查
+6. 写入 1 条测试数据 → 171 库 count 验证（用 influx CLI，勿用 curl count 高压 bug）
+7. `sync_delay_seconds` 稳定在 watermark+处理时间；`sync_e2e_delay_seconds` 同步收敛
+8. 滑窗如需开启：先完成 [pipeline-validation.md](pipeline-validation.md) 装置验证
