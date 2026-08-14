@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // newFakeInflux 返回模拟 InfluxDB 服务：记录查询 Q 与写入 body。
@@ -362,5 +363,95 @@ func TestQuerySQLInjectionGuard(t *testing.T) {
 		if _, err := querySQL(0, 1, QueryOptions{Measurements: []string{m}}); err != nil {
 			t.Fatalf("measurement %q must pass: %v", m, err)
 		}
+	}
+}
+
+// TestSchemaDegradeOnMetaFailure N5：SHOW 元查询失败时同步不得停摆——
+// 降级为类型推断兜底（字符串→field），负缓存短 TTL，不向调用方传播错误。
+func TestSchemaDegradeOnMetaFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("q")
+		if strings.HasPrefix(q, "SHOW TAG KEYS") || strings.HasPrefix(q, "SHOW FIELD KEYS") {
+			w.WriteHeader(http.StatusInternalServerError) // 元查询持续失败
+			return
+		}
+		fmt.Fprint(w, `{"results":[{"series":[{"name":"m","columns":["time","plant","value"],"values":[[1,"A01",9.9]]}]}]}`)
+	}))
+	defer srv.Close()
+	c := newTestClient(t, srv)
+	pts, err := c.QueryRange(context.Background(), 0, 10, QueryOptions{})
+	if err != nil {
+		t.Fatalf("QueryRange must not fail on meta failure (N5), got %v", err)
+	}
+	if len(pts) != 1 {
+		t.Fatalf("points=%d", len(pts))
+	}
+	// 类型推断兜底：plant 是 string field，值正常
+	if _, ok := pts[0].Fields["plant"]; !ok {
+		t.Fatalf("plant should be inferred as field: %+v", pts[0].Fields)
+	}
+	if v, ok := pts[0].Fields["value"].(float64); !ok || v != 9.9 {
+		t.Fatalf("value=%v (%T)", pts[0].Fields["value"], pts[0].Fields["value"])
+	}
+	// 负缓存：条目为 degraded 且短 TTL（30s），而非 1 小时
+	c.schemaMu.Lock()
+	e := c.schemaCache["m"]
+	c.schemaMu.Unlock()
+	if e == nil || !e.degraded {
+		t.Fatalf("expected degraded schema entry, got %+v", e)
+	}
+	if e.fresh() == false {
+		t.Fatal("degraded entry must be fresh right after fetch")
+	}
+}
+
+// TestSchemaRecoversAfterMetaHeals N5：元查询恢复后（负缓存过期）重新发现成功，
+// 后续查询用上真实 schema（integer 语义等）。
+func TestSchemaRecoversAfterMetaHeals(t *testing.T) {
+	var metaOK atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("q")
+		if strings.HasPrefix(q, "SHOW TAG KEYS") {
+			if !metaOK.Load() {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"m","columns":["tagKey"],"values":[["plant"]]}]}]}`)
+			return
+		}
+		if strings.HasPrefix(q, "SHOW FIELD KEYS") {
+			if !metaOK.Load() {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"m","columns":["fieldKey","fieldType"],"values":[["status","integer"]]}]}]}`)
+			return
+		}
+		fmt.Fprint(w, `{"results":[{"series":[{"name":"m","columns":["time","plant","status"],"values":[[1,"A01",7]]}]}]}`)
+	}))
+	defer srv.Close()
+	c := newTestClient(t, srv)
+	// 第一次：元查询失败 → 降级
+	pts, err := c.QueryRange(context.Background(), 0, 10, QueryOptions{})
+	if err != nil || len(pts) != 1 {
+		t.Fatalf("first query: %v", err)
+	}
+	if _, isTag := pts[0].Tags["plant"]; isTag {
+		t.Fatal("plant must not be tag in degraded mode")
+	}
+	// 模拟负缓存过期 + 元查询恢复
+	metaOK.Store(true)
+	c.schemaMu.Lock()
+	c.schemaCache["m"].fetchedAt = time.Now().Add(-schemaDegradeTTL - time.Second)
+	c.schemaMu.Unlock()
+	pts2, err := c.QueryRange(context.Background(), 0, 10, QueryOptions{})
+	if err != nil || len(pts2) != 1 {
+		t.Fatalf("second query: %v", err)
+	}
+	if pts2[0].Tags["plant"] != "A01" {
+		t.Fatalf("plant should be tag after recovery: %+v", pts2[0].Tags)
+	}
+	if v, ok := pts2[0].Fields["status"].(int64); !ok || v != 7 {
+		t.Fatalf("status must keep integer semantics after recovery: %v (%T)", pts2[0].Fields["status"], pts2[0].Fields["status"])
 	}
 }

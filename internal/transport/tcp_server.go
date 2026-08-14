@@ -189,9 +189,7 @@ func (s *Server) handleConn(ctx context.Context, id uint64, conn net.Conn) {
 	defer pipe.close()
 
 	// ACK 写回协程：按序输出（帧 k 写库完成且 k-1 已回才回它的 ACK）
-	ackDone := make(chan struct{})
 	go func() {
-		defer close(ackDone)
 		var idx int64
 		for {
 			ack, ok := pipe.nextResult(idx)

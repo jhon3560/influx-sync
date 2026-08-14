@@ -34,6 +34,7 @@ type Metrics struct {
 	skipPoint   atomic.Uint64 // point_skip_total：超限跳过的单点（防游标卡死）
 	lastWriteTs atomic.Int64  // receiver 最后落库点时间戳（ns，0=未知）
 	relayDLQ    atomic.Uint64 // relay_dlq_total：中继 WAL 失败转存计数
+	inflight    atomic.Int64  // receiver recv_inflight：在途处理帧数
 }
 
 // New 创建指标集合。
@@ -58,6 +59,9 @@ func (m *Metrics) IncDup()               { m.dupTotal.Add(1) }
 
 // AckFailCount 返回 ACK 失败计数（测试用）。
 func (m *Metrics) AckFailCount() uint64 { return m.ackFail.Load() }
+
+// AckOkCount 返回 ACK 成功计数（测试用）。
+func (m *Metrics) AckOkCount() uint64 { return m.ackOk.Load() }
 
 // --- 文档指标（《死信隔离与反压机制逻辑》）---
 
@@ -97,6 +101,13 @@ func (m *Metrics) IncRelayDLQ() { m.relayDLQ.Add(1) }
 
 // RelayDLQCount 返回中继转存计数（测试用）。
 func (m *Metrics) RelayDLQCount() uint64 { return m.relayDLQ.Load() }
+
+// IncInflight / DecInflight 维护 receiver 在途帧数（N2 小项：替代废弃 LRU 的可观测性）。
+func (m *Metrics) IncInflight() { m.inflight.Add(1) }
+func (m *Metrics) DecInflight() { m.inflight.Add(-1) }
+
+// Inflight 返回当前在途帧数（测试用）。
+func (m *Metrics) Inflight() int64 { return m.inflight.Load() }
 
 // DLQCount 返回死信计数（测试用）。
 func (m *Metrics) DLQCount() uint64 { return m.dlqTotal.Load() }
@@ -156,6 +167,9 @@ write_ok %d
 # HELP write_fail Receiver 写库失败总数
 # TYPE write_fail counter
 write_fail %d
+# HELP recv_inflight Receiver 在途处理帧数
+# TYPE recv_inflight gauge
+recv_inflight %d
 # HELP dup_total Receiver 去重命中总数
 # TYPE dup_total counter
 dup_total %d
@@ -173,7 +187,8 @@ sync_e2e_delay_seconds %d
 		m.walPending.Load(), m.walBytes.Load(),
 		m.sendTotal.Load(), m.ackOk.Load(), m.ackFail.Load(),
 		m.retry.Load(), m.dlqTotal.Load(), m.heartbeat.Load(), m.pollSkip.Load(),
-		m.recvTotal.Load(), m.writeOk.Load(), m.writeFail.Load(), m.dupTotal.Load(),
+		m.recvTotal.Load(), m.writeOk.Load(), m.writeFail.Load(),
+		m.inflight.Load(), m.dupTotal.Load(),
 		m.skipPoint.Load(), m.relayDLQ.Load(), m.e2eDelay())
 	// 文档指标（《死信隔离与反压机制逻辑》）
 	out += fmt.Sprintf(`# HELP influx_sync_wal_disk_usage_ratio WAL 挂载盘占用率

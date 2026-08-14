@@ -22,11 +22,9 @@ import (
 // Config Receiver 配置。
 type Config struct {
 	LastSeqFile string      // last_seq 持久化路径（空=不持久化）
-	DedupCap    int         // LRU 容量
 	DLQDir      string      // 毒丸死信目录（空=禁用 DLQ）
 	RelayWAL    *wal.WAL    // 中继转发 WAL（V1.3；空=不启用中继）
 	RelayDLQDir string      // 中继转发失败转存目录（C2：空=退化为仅告警）
-	OrderedSeq  bool        // 并发写库模式（A2 流水线）下 last_seq 按序推进（防跳序吞重试）
 	LastWriteTs func(int64) // 可选：落库点时间戳回调（A5 e2e 延迟指标），nil=不回调
 }
 
@@ -37,32 +35,31 @@ const seqJumpLimit uint64 = 100000
 // 依据协议：写库成功后才回 0xff，保证“ACK = 已落库”。
 type Receiver struct {
 	client  *influx.Client
-	dedup   *LRU
 	metrics *monitor.Metrics
 	logger  *zap.Logger
 	cfg     Config
-	lastSeq atomic.Int64 // 已成功处理的最大 seq（内存）
-	seqOrd  *seqTracker  // OrderedSeq 模式下的按序 seq 推进器（nil=直接 max 推进）
+	lastSeq atomic.Int64 // 已成功处理的最大连续 seq（内存；只增不减）
+	seqOrd  *seqTracker  // 按序 seq 推进器（N2：恒开——流水线/多连接下乱序完成安全）
 
 	persistMu sync.Mutex
 	persistAt time.Time // last_seq 持久化节流（每秒最多一次）
 }
 
 // New 创建 Receiver。
+// last_seq 采用**连续前缀推进**语义（seqTracker 恒开，N2）：
+// 乱序完成的帧只记入 pending，绝不把 last_seq 推过未完成的在途帧——
+// 否则该帧瞬时失败后的重传会被 "seq<=last_seq" 吞掉（数据丢失）。
+// 停等 sender 下帧严格按序到达，行为与旧 max 推进一致；小缺口（如双方
+// last_seq/WAL 同时丢失）不再推进 last_seq，但正确性由幂等重写兜底。
 func New(client *influx.Client, metrics *monitor.Metrics, logger *zap.Logger, cfg Config) (*Receiver, error) {
-	r := &Receiver{client: client, dedup: NewLRU(cfg.DedupCap), metrics: metrics, logger: logger, cfg: cfg}
-	if cfg.OrderedSeq {
-		r.seqOrd = newSeqTracker()
-	}
+	r := &Receiver{client: client, metrics: metrics, logger: logger, cfg: cfg, seqOrd: newSeqTracker()}
 	if cfg.LastSeqFile != "" {
 		seq, err := loadLastSeq(cfg.LastSeqFile)
 		if err != nil {
 			return nil, err
 		}
 		r.lastSeq.Store(seq)
-		if r.seqOrd != nil {
-			r.seqOrd.init(uint64(seq))
-		}
+		r.seqOrd.init(uint64(seq))
 		logger.Info("receiver restored last_seq", zap.Int64("seq", seq))
 	}
 	return r, nil
@@ -82,12 +79,17 @@ func (r *Receiver) HandleFrame(connID uint64, frameBytes []byte) byte {
 		return protocol.AckSuccess
 	}
 
-	// 重复检测：已成功处理的旧 seq 直接确认
+	// 重复检测：已成功处理的连续前缀直接确认
+	// （并发写库下 last_seq 只按连续前缀推进，保证此判定绝不吞掉未完成帧）
 	if f.Seq <= uint64(r.lastSeq.Load()) {
 		r.metrics.IncDup()
 		r.logger.Debug("duplicate seq (<=last_seq)", zap.Uint64("seq", f.Seq))
 		return protocol.AckSuccess
 	}
+
+	// 在途帧计数（指标；替代 V1.4 写死的 LRU——LRU 查询结果无人消费属废状态）
+	r.metrics.IncInflight()
+	defer r.metrics.DecInflight()
 
 	// seq 跳跃告警但不拒绝：Influx 幂等覆盖保证最终一致，
 	// 拒绝会导致 Sender 停等重发同一帧、链路永久卡死（如 last_seq 文件被
@@ -158,9 +160,8 @@ func (r *Receiver) HandleFrame(connID uint64, frameBytes []byte) byte {
 		return protocol.AckFail // 可重试：不更新 last_seq，不确认；Sender 重发
 	}
 	r.metrics.IncWriteOk()
-	// 去重登记必须在写库成功之后（修复：此前写前登记导致瞬时失败→重发同 seq
-	// 被 LRU 吞掉直接回 0xff 的数据永久丢失缺陷）。
-	r.dedup.CheckAndAdd(f.Seq)
+	// 写库成功后无额外去重登记：last_seq 连续推进 + 幂等写入已覆盖重复帧；
+	// 并发同 seq 在途重复（滑窗重发窗口内）双写幂等无害。
 
 	// V1.3 中继：写库成功的同时，原始 Line Protocol 写入转发 WAL（
 	// 由中继 Sender 发往下一跳；转发失败由 WAL 缓冲重试，不丢数据）。
@@ -200,24 +201,26 @@ func (r *Receiver) HandleFrame(connID uint64, frameBytes []byte) byte {
 }
 
 // markDone 帧处理完成（写库成功或毒丸隔离）：推进 last_seq 并节流持久化。
-// OrderedSeq 模式（并发流水线）下按序推进：只推进连续前缀，跳过的帧等
-// 重传补齐——防止帧 k+1 先完成把 last_seq 推过仍在途的帧 k，重传 k 被
-// "seq<=last_seq" 吞掉导致丢数据。
+// seqTracker 只推进连续前缀：跳过的帧等重传补齐——防止帧 k+1 先完成把
+// last_seq 推过仍在途的帧 k，重传 k 被 "seq<=last_seq" 吞掉导致丢数据。
+// 超大跳跃（>seqJumpLimit，双方持久化重置）直接越过（该区间帧不会再出现）。
 func (r *Receiver) markDone(seq uint64) {
-	if r.seqOrd != nil {
-		if adv := r.seqOrd.done(seq); !adv {
-			return
-		}
-		seq = r.seqOrd.load()
+	if !r.seqOrd.done(seq) {
+		return
 	}
-	r.advanceSeq(seq)
+	r.advanceSeq(r.seqOrd.load())
 }
 
-// advanceSeq 推进 last_seq（内存 + 节流持久化）。
+// advanceSeq 推进 last_seq（只增不减 CAS）+ 节流持久化。
 // 持久化节流为每秒最多一次：崩溃窗口内丢失的推进由 Sender 重发 + Influx
 // 幂等覆盖兜底（At-Least-Once 不受影响）。
 func (r *Receiver) advanceSeq(seq uint64) {
-	r.lastSeq.Store(int64(seq))
+	for {
+		cur := r.lastSeq.Load()
+		if int64(seq) <= cur || r.lastSeq.CompareAndSwap(cur, int64(seq)) {
+			break
+		}
+	}
 	if r.cfg.LastSeqFile == "" {
 		return
 	}
@@ -274,14 +277,21 @@ func lastPointTimestamp(raw []byte) int64 {
 	return n
 }
 
-// seqTracker 并发写库模式（A2 流水线）下的按序 seq 推进器。
-// 帧可能乱序完成：只推进连续前缀；大跳跃（>seqJumpLimit，WAL 重置）直接越过。
+// seqTracker 按序 seq 推进器（N2：恒开）。
+// 帧可能乱序完成（流水线/多连接）：只推进连续前缀；大跳跃
+// （>seqJumpLimit，双方持久化重置、该区间帧永不再来）直接越过。
 // 待补帧由重传自然闭合（go-back-N 重发从失败帧起的所有在途帧）。
 type seqTracker struct {
 	mu      sync.Mutex
 	last    uint64
-	pending map[uint64]struct{}
+	pending map[uint64]struct{} // 已完成但非连续的帧
 }
+
+// seqPendingLimit pending 上限。go-back-N sender 在失败帧上阻塞、无法产生
+// 超过窗口大小的后继完成帧，现实中不可达；到达上限说明缺口是永久性的
+// （双方持久化同时丢失），此时只清空 pending（都是已完成帧，清空仅降低
+// 去重效率，重传会幂等重写，绝不跳越 last_seq 去吞帧）。
+const seqPendingLimit = 65536
 
 func newSeqTracker() *seqTracker {
 	return &seqTracker{pending: make(map[uint64]struct{})}
@@ -318,15 +328,12 @@ func (t *seqTracker) done(seq uint64) bool {
 		t.last++
 		advanced = true
 	}
-	// 防无界：pending 超过上限视为永久缺口（双方持久化均丢失的病理场景）
-	if len(t.pending) > 65536 {
-		for s := range t.pending {
-			if s > t.last {
-				t.last = s
-			}
-		}
+	// N4：溢出时只推进连续前缀 + 清空 pending（保留缺口，绝不跳越）。
+	// 重传的已清空帧会幂等重写，正确性不受影响。
+	if len(t.pending) > seqPendingLimit {
+		zap.L().Error("seqTracker pending overflow: gap never closed (both-side persistence lost?). Clearing completed set; correctness kept by idempotent rewrite",
+			zap.Uint64("last_seq", t.last), zap.Int("pending", len(t.pending)))
 		t.pending = make(map[uint64]struct{})
-		advanced = true
 	}
 	return advanced
 }

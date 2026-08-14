@@ -51,7 +51,8 @@ func writeDLQJSON(dir string, meta DLQMeta, gzipPayload []byte) (string, error) 
 	if err != nil {
 		return "", fmt.Errorf("dlq: marshal: %w", err)
 	}
-	name := fmt.Sprintf("dlq_%d_%s.json", meta.SeqNum, time.Now().Format("20060102T150405"))
+	// 名字带纳秒后缀：同 seq 一秒内重试两次不再互相覆盖
+	name := fmt.Sprintf("dlq_%d_%s_%d.json", meta.SeqNum, time.Now().Format("20060102T150405"), time.Now().UnixNano())
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return "", fmt.Errorf("dlq: write %s: %w", path, err)

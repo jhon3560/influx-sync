@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
+
 	"influx-sync/internal/model"
 )
 
@@ -38,11 +40,22 @@ type Client struct {
 	schemaFlights map[string]*schemaCall // single-flight：并发去重 schema 发现
 }
 
-// schemaEntry 一个 measurement 的 schema 定义。
+// schemaEntry 一个 measurement 的 schema 定义。degraded=true 表示元查询
+// 失败后的降级条目（类型推断兜底），用短 TTL 负缓存，到期重试发现。
 type schemaEntry struct {
 	tags      map[string]bool   // tag key 集合
 	fieldType map[string]string // field key -> 类型（float/integer/string/boolean）
 	fetchedAt time.Time
+	degraded  bool
+}
+
+// fresh 判断条目是否仍在有效期内（降级条目短 TTL）。
+func (e *schemaEntry) fresh() bool {
+	ttl := schemaCacheTTL
+	if e.degraded {
+		ttl = schemaDegradeTTL
+	}
+	return time.Since(e.fetchedAt) < ttl
 }
 
 // schemaCall 一次进行中的 schema 发现（single-flight）。
@@ -52,7 +65,10 @@ type schemaCall struct {
 	err   error
 }
 
-const schemaCacheTTL = time.Hour
+const (
+	schemaCacheTTL   = time.Hour        // 成功发现的 schema 缓存
+	schemaDegradeTTL = 30 * time.Second // 失败降级负缓存（N5：短 TTL 后重试，不永久停摆）
+)
 
 // WriteHTTPError 写库 HTTP 错误（带状态码，供错误分类器 typed 判断，
 // 替代解析错误文案）。
@@ -146,7 +162,8 @@ func queryTimeout(start, end int64) time.Duration {
 	return d
 }
 
-// pointSet 边界去重集合：小集合零分配线性比较，大集合自动切换 Key 映射。
+// pointSet 边界去重集合：小集合用零分配的 PointsEqual 线性比较，
+// 大集合自动切换 Key 映射（大集合才付出 Key 字符串构造成本）。
 type pointSet struct {
 	small []model.Point
 	big   map[string]struct{}
@@ -342,11 +359,12 @@ func (c *Client) queryOnce(ctx context.Context, start, end int64, opt QueryOptio
 
 // ensureSchema 获取 measurement 的 schema 定义（tag keys + field 类型），带缓存。
 // 显式指定 tagColumns 时跳过 tag 自动发现。
-// single-flight：同一 measurement 的并发发现合并为一次 HTTP 往返；
-// 发现失败不缓存（下次查询重试），避免空 schema 缓存 1 小时导致类型写错。
+// single-flight：同一 measurement 的并发发现合并为一次 HTTP 往返。
+// N5：元查询失败**不传播错误、不停摆同步**——降级为类型推断兜底（v1.3.1
+// 行为），负缓存短 TTL（30s）后自动重试发现；成功条目缓存 1 小时。
 func (c *Client) ensureSchema(ctx context.Context, measurement string, tagColumns []string) (*schemaEntry, error) {
 	c.schemaMu.Lock()
-	if e, ok := c.schemaCache[measurement]; ok && time.Since(e.fetchedAt) < schemaCacheTTL {
+	if e, ok := c.schemaCache[measurement]; ok && e.fresh() {
 		c.schemaMu.Unlock()
 		return e, nil
 	}
@@ -359,14 +377,11 @@ func (c *Client) ensureSchema(ctx context.Context, measurement string, tagColumn
 			return nil, ctx.Err()
 		}
 		c.schemaMu.Lock()
-		if e, ok := c.schemaCache[measurement]; ok && time.Since(e.fetchedAt) < schemaCacheTTL {
+		if e, ok := c.schemaCache[measurement]; ok && e.fresh() {
 			c.schemaMu.Unlock()
 			return e, nil
 		}
 		c.schemaMu.Unlock()
-		if call.err != nil {
-			return nil, call.err
-		}
 		return nil, fmt.Errorf("influx: schema discovery of %s failed", measurement)
 	}
 	call := &schemaCall{done: make(chan struct{})}
@@ -380,14 +395,22 @@ func (c *Client) ensureSchema(ctx context.Context, measurement string, tagColumn
 	if err == nil {
 		entry.fetchedAt = time.Now()
 		c.schemaCache[measurement] = entry
+	} else {
+		// 降级：类型推断兜底 + 短 TTL 负缓存（到期重试，不向调用方传播）
+		entry.degraded = true
+		entry.fetchedAt = time.Now()
+		c.schemaCache[measurement] = entry
+		zap.L().Warn("influx: schema discovery failed, degraded to type inference (retry in 30s)",
+			zap.String("measurement", measurement), zap.Error(err))
 	}
-	call.entry, call.err = entry, err
+	call.entry, call.err = entry, nil
 	close(call.done)
 	c.schemaMu.Unlock()
-	return entry, err
+	return entry, nil
 }
 
 // fetchSchema 执行 SHOW TAG KEYS / SHOW FIELD KEYS（不持锁，不缓存）。
+// 失败时返回已发现的部分条目 + error（调用方降级为类型推断兜底）。
 func (c *Client) fetchSchema(ctx context.Context, measurement string, tagColumns []string) (*schemaEntry, error) {
 	e := &schemaEntry{tags: map[string]bool{}, fieldType: map[string]string{}}
 	if len(tagColumns) > 0 {
@@ -425,7 +448,7 @@ func (c *Client) fetchSchema(ctx context.Context, measurement string, tagColumns
 		}
 	}
 	if len(errs) > 0 {
-		return nil, fmt.Errorf("influx: schema discovery of %s: %v", measurement, errs)
+		return e, fmt.Errorf("influx: schema discovery of %s: %v", measurement, errs)
 	}
 	return e, nil
 }

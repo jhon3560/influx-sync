@@ -368,14 +368,15 @@ func (c *ReceiverConfig) ServerConfig() transport.ServerConfig {
 }
 
 // ReceiverConfig 转换（Receiver 模块）。
+// N2：last_seq 按序推进（seqTracker）在 Receiver 内恒开，与 TCP MaxInflight
+// 的实际生效值无关——默认配置（max_inflight 空→服务端按 8 生效）不再出现
+// "流水线服务端 + 非按序推进"的危险错配。
 func (c *ReceiverConfig) ReceiverConfig() receiver.Config {
 	return receiver.Config{
 		LastSeqFile: c.Dedup.LastSeqFile,
-		DedupCap:    c.Dedup.Cap,
 		DLQDir:      c.DLQ.Dir,
 		RelayWAL:    c.RelayWAL, // 由 main 注入（需要 wal 包），nil=不启用中继
 		RelayDLQDir: c.Relay.DLQDir,
-		OrderedSeq:  c.TCP.MaxInflight > 1, // A2 流水线下 last_seq 按序推进
 	}
 }
 

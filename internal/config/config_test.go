@@ -125,7 +125,7 @@ monitor:
 		t.Fatalf("read timeout=%v", sc.ReadTimeout)
 	}
 	rc := cfg.ReceiverConfig()
-	if rc.DedupCap != 20000 || rc.LastSeqFile != "/data/last_seq" {
+	if rc.LastSeqFile != "/data/last_seq" {
 		t.Fatalf("receiver cfg=%+v", rc)
 	}
 }

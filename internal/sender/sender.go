@@ -174,15 +174,21 @@ func (s *Sender) Run(ctx context.Context) {
 // runPipeline 滑窗发送一轮（A1 实验项，Pipeline>1）：连续发 W 帧后按序读回
 // W 个 ACK；第 k 个 0x00 触发 go-back-N（从 k 起重发）。返回更新后的 retryCount。
 // 协议兼容：每个帧仍恰好对应一个响应字节，只是同连接多帧在途。
+//
+// N1 修复：0x00/非法 ACK/发送失败一律视为**连接级失败**——立即关闭连接重连后
+// 从 nackAt 起重发整个尾窗。关闭连接排干了第 1 轮 i+1..W-1 帧的陈旧 ACK 字节，
+// 避免重发后 ACK 流错位导致"提交从未写库的帧"（At-Least-Once 红线）。
+// receiver 侧幂等写入 + 按序 lastSeq 去重保证重发不产生重复计数。
 func (s *Sender) runPipeline(ctx context.Context, seq uint64, frameBytes []byte, retryCount int) int {
 	w := s.cfg.Pipeline
-	frames := []wal.FrameData{{Seq: seq, Bytes: frameBytes}}
-	// 批量 Peek 剩余窗口帧（无则不阻塞）
-	if more, err := s.wal.PeekBatch(w); err == nil {
-		frames = more
+	// 一次 PeekBatch 取满窗口（避免首个 Peek 结果被丢弃 + 重复读盘 W×1MB）
+	frames, err := s.wal.PeekBatch(w)
+	if err != nil {
+		frames = []wal.FrameData{{Seq: seq, Bytes: frameBytes}}
 	}
 	for {
-		// 发送全部在途帧
+		// 发送全部在途帧；失败即中断（连接已坏，后续发送必败）
+		sendNack := -1
 		for i, f := range frames {
 			select {
 			case <-ctx.Done():
@@ -208,8 +214,21 @@ func (s *Sender) runPipeline(ctx context.Context, seq uint64, frameBytes []byte,
 				if retryCount > s.cfg.MaxRetry {
 					retryCount = s.cfg.MaxRetry
 				}
-				continue
+				sendNack = i
+				break // 连接已断：0..i-1 的 ACK 随连接丢失，从 i 起重发
 			}
+		}
+		if sendNack >= 0 {
+			if err := s.client.EnsureConnected(); err != nil {
+				s.logger.Warn("pipeline reconnect failed", zap.Error(err))
+				s.metrics.IncRetry()
+				retryCount++
+				if retryCount > s.cfg.MaxRetry {
+					retryCount = s.cfg.MaxRetry
+				}
+			}
+			frames = frames[sendNack:]
+			continue
 		}
 		// 按序读回 ACK：0x00 处从该帧起重发（go-back-N）
 		nackAt := -1
@@ -223,7 +242,7 @@ func (s *Sender) runPipeline(ctx context.Context, seq uint64, frameBytes []byte,
 					retryCount = s.cfg.MaxRetry
 				}
 				nackAt = i
-				break
+				break // WaitAck 失败已自动关闭连接：陈旧 ACK 流随连接消亡
 			}
 			switch ack {
 			case protocol.AckSuccess:
@@ -243,12 +262,14 @@ func (s *Sender) runPipeline(ctx context.Context, seq uint64, frameBytes []byte,
 					retryCount = s.cfg.MaxRetry
 				}
 				nackAt = i
-				// 丢弃 i 之后的已读 ACK 无需处理：receiver 按序回 ACK，
-				// go-back-N 重发 i..W-1，receiver 会重新回全部 ACK
+				// N1：0x00 = 连接级失败。关连接重连再重发——重连天然清空
+				// 线上残留的 i+1..W-1 陈旧 ACK，杜绝 ACK 错位提交
+				s.client.Close()
 			default:
 				s.logger.Warn("invalid ack byte", zap.Uint64("seq", frames[i].Seq), zap.Uint8("ack", ack))
 				retryCount++
 				nackAt = i
+				s.client.Close()
 			}
 			if nackAt >= 0 {
 				break
@@ -257,7 +278,8 @@ func (s *Sender) runPipeline(ctx context.Context, seq uint64, frameBytes []byte,
 		if nackAt < 0 {
 			return retryCount // 全窗确认完成
 		}
-		// go-back-N：从 nackAt 重发，并补足窗口
+		// go-back-N：重连后从 nackAt 起重发尾窗（窗口缩窄不 refill，
+		// 避免每轮重读盘；下一轮外层循环 PeekBatch 补满）
 		if err := s.client.EnsureConnected(); err != nil {
 			s.logger.Warn("pipeline reconnect failed", zap.Error(err))
 			s.metrics.IncRetry()
@@ -267,15 +289,6 @@ func (s *Sender) runPipeline(ctx context.Context, seq uint64, frameBytes []byte,
 			}
 		}
 		frames = frames[nackAt:]
-		if more, err := s.wal.PeekBatch(w); err == nil {
-			// 补窗口：确保 frames 覆盖从 nackAt 起的在途帧（同 seq 重发）
-			if len(more) > len(frames) {
-				// PeekBatch 从头返回：只要 seq 前缀一致，取前缀重发 + 新帧
-				if more[0].Seq == frames[0].Seq {
-					frames = more
-				}
-			}
-		}
 	}
 }
 

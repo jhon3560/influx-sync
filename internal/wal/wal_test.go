@@ -574,3 +574,66 @@ func TestAppendBatchGroupCommit(t *testing.T) {
 		t.Fatal("out-of-order batch must fail")
 	}
 }
+
+// TestMidSegmentCorruptionSkipsSingleRecord N3/P1：中段 bit-rot（记录头长度字段
+// 损坏但后续帧完好）→ 只跳过坏帧并重同步，不截断整个尾部（丢一帧而非一尾）。
+func TestMidSegmentCorruptionSkipsSingleRecord(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+	w, err := Open(walDir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 三帧落盘
+	seqs := make([]uint64, 0, 3)
+	for i := 0; i < 3; i++ {
+		s, err := w.Append(protocol.TypeData, []byte(fmt.Sprintf("m value=%d %d", i, i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		seqs = append(seqs, s)
+	}
+	w.SetCursor(100)
+	w.Close()
+
+	// 定位第 2 帧（seqs[1]）的记录头并破坏其长度字段
+	segPath0 := segPath(walDir, 0)
+	f, err := os.OpenFile(segPath0, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 帧 1 长度：read record head at 0
+	var head [4]byte
+	f.ReadAt(head[:], 0)
+	off := int64(recordHeadLen) + int64(binary.BigEndian.Uint32(head[:]))
+	// 破坏帧 2 的长度字段（bit-rot 模拟）
+	f.WriteAt([]byte{0xFF, 0xFF, 0xFF, 0xFF}, off)
+	st, _ := f.Stat()
+	sizeBefore := st.Size()
+	f.Close()
+
+	// 重开：必须成功；帧 2 被跳过，帧 1/3 完好；文件未被截断（帧 3 仍在）
+	w2, err := Open(walDir, 0)
+	if err != nil {
+		t.Fatalf("open after mid-segment corruption: %v", err)
+	}
+	defer w2.Close()
+	if w2.PendingCount() != 2 {
+		t.Fatalf("pending=%d, want 2 (corrupt frame skipped, others kept)", w2.PendingCount())
+	}
+	s1, _, err := w2.Peek()
+	if err != nil || s1 != seqs[0] {
+		t.Fatalf("peek1 seq=%d err=%v", s1, err)
+	}
+	if err := w2.Commit(s1); err != nil {
+		t.Fatal(err)
+	}
+	s3, _, err := w2.Peek()
+	if err != nil || s3 != seqs[2] {
+		t.Fatalf("peek2 seq=%d err=%v (frame after corruption must survive)", s3, err)
+	}
+	st2, _ := os.Stat(segPath0)
+	if st2.Size() != sizeBefore {
+		t.Fatalf("file truncated: %d -> %d (must skip single record, not whole tail)", sizeBefore, st2.Size())
+	}
+}

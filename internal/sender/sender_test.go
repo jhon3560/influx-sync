@@ -543,3 +543,58 @@ func TestQueryParallelBoundaryDedup(t *testing.T) {
 		}
 	}
 }
+
+// TestSenderPipelineNackFrameNeverCommitted N1/P0 回归：seq=1 永远 0x00 时，
+// 滑窗绝不提交未写库成功的帧（修复前陈旧 ACK 错位会把 f1 误提交删除，
+// 且 f2/f3 的 ACK 位被 f1 的重发字节占位——pending 会掉到 0，At-Least-Once 被破坏）。
+func TestSenderPipelineNackFrameNeverCommitted(t *testing.T) {
+	var seq1Nack atomic.Int64
+	var seq1OK atomic.Int64
+	srv := transport.NewServer(transport.ServerConfig{Listen: "127.0.0.1:0", MaxInflight: 8}, func(id uint64, fb []byte) byte {
+		f, err := protocol.Decode(fb)
+		if err != nil {
+			return protocol.AckFail
+		}
+		if f.Seq == 1 {
+			seq1Nack.Add(1)
+			return protocol.AckFail // seq=1 永远瞬时失败（大帧超时等场景）
+		}
+		return protocol.AckSuccess
+	})
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	ctxSrv, cancelSrv := context.WithCancel(context.Background())
+	go srv.Serve(ctxSrv)
+	t.Cleanup(func() { cancelSrv(); srv.Close() })
+
+	w, m, _ := newTestEnv(t, "")
+	for i := 0; i < 4; i++ {
+		if _, err := w.Append(protocol.TypeData, []byte(fmt.Sprintf("m value=%d %d", i, i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client := transport.NewClient(transport.ClientConfig{Addr: srv.Addr().String(), Timeout: 2 * time.Second})
+	s := NewSender(w, client, m, testLogger(t), SenderConfig{
+		MaxRetry: 10, BackoffBase: 10 * time.Millisecond, BackoffMax: 100 * time.Millisecond,
+		IdleSleep: 10 * time.Millisecond, HeartbeatInterval: time.Hour, Pipeline: 4,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	go func() { s.Run(ctx) }()
+	// 观察 3 秒：seq=1 持续失败。修复前 pending 会归零（误提交）；修复后必须保持 4
+	time.Sleep(3 * time.Second)
+	if w.PendingCount() != 4 {
+		t.Fatalf("pending=%d, want 4 (seq=1 never written, must NOT be committed; stale-ACK misalignment regression)", w.PendingCount())
+	}
+	if seq1Nack.Load() < 3 {
+		t.Fatalf("seq1 nack=%d, want >=3 (retry loop active)", seq1Nack.Load())
+	}
+	if seq1OK.Load() != 0 {
+		t.Fatalf("seq1 ok=%d, must be 0", seq1OK.Load())
+	}
+	// 确认没有任何帧被提交：seq=1 卡头，go-back-N 下 2..4 也不得越过提交
+	if s.metrics.AckOkCount() != 0 {
+		t.Fatalf("ack_ok=%d, want 0 (nothing may be committed while head nacks)", s.metrics.AckOkCount())
+	}
+}

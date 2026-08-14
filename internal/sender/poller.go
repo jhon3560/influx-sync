@@ -372,7 +372,8 @@ func (p *Poller) queryParallel(ctx context.Context, start, end int64) ([]model.P
 	return all, nil
 }
 
-// boundarySet 边界时间戳去重集合：小集合零分配线性比较，大集合自动切换 Key 映射。
+// boundarySet 边界时间戳去重集合：小集合用零分配的 PointsEqual 线性比较，
+// 大集合自动切换 Key 映射（大集合才付出 Key 字符串构造成本）。
 type boundarySet struct {
 	small []model.Point
 	big   map[string]struct{}

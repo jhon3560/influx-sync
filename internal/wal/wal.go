@@ -212,12 +212,14 @@ func (w *WAL) scanSegments() error {
 
 // indexSegment 扫描单个段文件，建立帧索引；offset<skip 的帧视为已确认跳过。
 //
-// 撕裂尾部恢复（C1/P0）：追加写是严格顺序的（头与体两次 Write + O_APPEND），
+// 尾部撕裂恢复（C1/P0）：追加写是严格顺序的（头与体两次 Write + O_APPEND），
 // 崩溃只会撕裂最后一条记录（头部分写入 / 头完整但体不完整）。扫描到首个
-// 无效记录即视为撕裂尾：截断到记录起点并记日志，而不是整体失败导致进程
-// 起不来。截断安全性：游标在 append 全部成功后才推进（SetCursor），尾部
-// 未完成帧对应窗口会由 Poller 重新查询补回；若损坏记录已完整落盘（bit rot
-// 等极端情况），截断跳过它保证主链路不被毒丸卡死，同样记 Error 日志。
+// 无效记录且其后无合法记录（重同步失败）时视为撕裂尾：截断到记录起点并记
+// 日志，而不是整体失败导致进程起不来。
+//
+// 中段损坏（N3/P1）：bit-rot 等造成的坏记录如果后面还有合法帧，只跳过
+// 单个坏记录并向前重新同步（丢一帧而非一尾，最多 64MB）；截断只在真尾部
+// 损坏（重同步找不到下一个合法帧头）时发生。
 func (w *WAL) indexSegment(idx int, path string, skip int64) error {
 	f, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
@@ -231,25 +233,34 @@ func (w *WAL) indexSegment(idx int, path string, skip int64) error {
 	fileSize := st.Size()
 	buf := make([]byte, recordHeadLen+protocol.HeaderSize)
 	var off int64
-	truncateTail := func(badOff int64, detail string) error {
+	// skipCorrupt：遇到无效记录时先尝试重同步；找不到后续合法记录才截断（撕裂尾）。
+	// 返回新的扫描起点；返回 -1 表示无合法后续（调用方截断）。
+	skipCorrupt := func(badOff int64, detail string) (int64, error) {
+		if next := resyncRecord(f, fileSize, badOff); next >= 0 {
+			zap.L().Warn("wal: skipping corrupt record in segment",
+				zap.String("segment", path), zap.Int64("offset", badOff),
+				zap.Int64("resync_to", next), zap.Int64("skipped_bytes", next-badOff),
+				zap.String("detail", detail))
+			return next, nil
+		}
 		if badOff < skip {
-			// 撕裂记录位于已确认区域内（checkpoint 与文件不一致的极端损坏）
-			return fmt.Errorf("wal: corrupt segment %s at offset %d (%s) inside acked prefix, refuse to guess", path, badOff, detail)
+			// 无效记录位于已确认区域内（checkpoint 与文件不一致的极端损坏）
+			return -1, fmt.Errorf("wal: corrupt segment %s at offset %d (%s) inside acked prefix, refuse to guess", path, badOff, detail)
 		}
 		if err := f.Truncate(badOff); err != nil {
-			return fmt.Errorf("wal: truncate torn tail of %s at %d: %w", path, badOff, err)
+			return -1, fmt.Errorf("wal: truncate torn tail of %s at %d: %w", path, badOff, err)
 		}
 		zap.L().Error("wal: truncated torn tail record",
 			zap.String("segment", path), zap.Int64("offset", badOff),
 			zap.Int64("dropped_bytes", fileSize-badOff), zap.String("detail", detail))
-		return nil
+		return -1, nil
 	}
 	for {
 		n, err := f.ReadAt(buf[:recordHeadLen], off)
 		if err != nil {
 			if n > 0 {
-				// 头部分写入（1~3 字节）：撕裂尾，截断后结束
-				if terr := truncateTail(off, "torn record head"); terr != nil {
+				// 头部分写入（1~3 字节）：尾部撕裂，截断后结束（后续不可能有合法帧）
+				if _, terr := skipCorrupt(off, "torn record head"); terr != nil {
 					return terr
 				}
 			}
@@ -257,24 +268,37 @@ func (w *WAL) indexSegment(idx int, path string, skip int64) error {
 		}
 		length := int(binary.BigEndian.Uint32(buf[:recordHeadLen]))
 		if length <= 0 || length > protocol.MaxFrameLen {
-			if terr := truncateTail(off, fmt.Sprintf("bad length %d", length)); terr != nil {
+			next, terr := skipCorrupt(off, fmt.Sprintf("bad length %d", length))
+			if terr != nil {
 				return terr
 			}
-			break
+			if next < 0 {
+				break
+			}
+			off = next
+			continue
 		}
 		if _, err := f.ReadAt(buf[recordHeadLen:], off+recordHeadLen); err != nil {
 			// 头完整 + 帧体撕裂（崩溃落在两次 Write 之间）→ 截断尾部恢复
-			if terr := truncateTail(off, "torn frame body"); terr != nil {
+			if _, terr := skipCorrupt(off, "torn frame body"); terr != nil {
 				return terr
 			}
 			break
 		}
 		hdr, err := protocol.ParseHeader(buf[recordHeadLen:])
-		if err != nil {
-			if terr := truncateTail(off, fmt.Sprintf("bad frame header: %v", err)); terr != nil {
+		// 记录长度必须与帧头 Length 一致（[u32 len] = HeaderSize + payload）——
+		// 不一致说明记录头损坏（bit-rot），否则按错长度扫描会错位吞掉后续全部帧
+		if err != nil || int64(length) != int64(protocol.HeaderSize)+int64(hdr.Length) {
+			detail := fmt.Sprintf("bad frame header: %v (recLen=%d hdrLen=%d)", err, length, hdr.Length)
+			next, terr := skipCorrupt(off, detail)
+			if terr != nil {
 				return terr
 			}
-			break
+			if next < 0 {
+				break
+			}
+			off = next
+			continue
 		}
 		if off+recordHeadLen+int64(length) <= skip {
 			// 已确认
@@ -286,6 +310,43 @@ func (w *WAL) indexSegment(idx int, path string, skip int64) error {
 		off += recordHeadLen + int64(length)
 	}
 	return nil
+}
+
+// resyncRecord 从 badOff+1 起向前扫描，寻找下一个合法记录起点：
+// [u32 len] 合法（0<len≤MaxFrameLen）+ 帧头可解析（魔数/版本/长度）+ 记录不越过 EOF。
+// 扫描上限为 MaxFrameLen+头（下一合法记录必在坏记录真实末尾之后，而真实帧长≤MaxFrameLen）。
+// 找不到返回 -1（视为尾部损坏，由调用方截断）。
+func resyncRecord(f *os.File, fileSize, badOff int64) int64 {
+	limit := badOff + int64(protocol.MaxFrameLen+recordHeadLen)
+	if limit > fileSize {
+		limit = fileSize
+	}
+	var head [recordHeadLen + protocol.HeaderSize]byte
+	for p := badOff + 1; p+int64(recordHeadLen+protocol.HeaderSize) <= limit; p++ {
+		if _, err := f.ReadAt(head[:recordHeadLen], p); err != nil {
+			break
+		}
+		length := int(binary.BigEndian.Uint32(head[:recordHeadLen]))
+		if length <= 0 || length > protocol.MaxFrameLen {
+			continue
+		}
+		if p+recordHeadLen+int64(length) > fileSize {
+			continue
+		}
+		if _, err := f.ReadAt(head[recordHeadLen:], p+recordHeadLen); err != nil {
+			break
+		}
+		hdr, err := protocol.ParseHeader(head[recordHeadLen:])
+		if err != nil {
+			continue
+		}
+		// 长度一致性：记录头 len 必须等于 HeaderSize + 帧头 Length
+		if int64(length) != int64(protocol.HeaderSize)+int64(hdr.Length) {
+			continue
+		}
+		return p
+	}
+	return -1
 }
 
 func (w *WAL) lastSegmentIdx() (int, error) {

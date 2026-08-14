@@ -76,8 +76,9 @@ tcp:
   max_conns: 0                  # 最大并发连接（0=不限制）
 
 dedup:
-  cap: 10000                    # LRU 去重容量（in-flight 窗口）
-  last_seq_file: /opt/influx-sync/data/last_seq-174  # 已处理最大 seq 持久化
+  # V1.4.1：LRU 去重已移除（写死废状态），last_seq 连续前缀推进 + 幂等写入兜底；
+  # 在途帧数通过 recv_inflight 指标观测
+  last_seq_file: /opt/influx-sync/data/last_seq-174  # 已处理最大连续 seq 持久化
 
 dlq:
   dir: /opt/influx-sync/data/dlq-174  # 毒丸死信目录（空=禁用 DLQ，退回重试）

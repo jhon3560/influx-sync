@@ -110,3 +110,61 @@ BenchmarkLinesToProtocolBytes-16  5.84 ms/万点    5.2MB/万点
 ```
 
 全部测试（含 -race）通过；新增回归测试 20+ 个。
+
+---
+
+## V1.4.1 修复记录（2026-08-14，滑窗缺陷复审 N1-N5）
+
+V1.4.0 交付后复审发现滑窗路径 1 个 P0 + 2 个 P1 + 2 个 P2 + 6 个小项，全部修复并补回归测试。
+
+### N1（P0，实测复现）：滑窗 go-back-N 陈旧 ACK 错位 → 提交从未写库的帧
+
+第 1 轮 i+1..W-1 帧的陈旧 0xff 残留在线上，0x00 后重发被误读为"重发帧的 ACK"，
+f1 未写库却被提交删除（At-Least-Once 被破坏），随后退化为 commit out-of-order 死循环。
+
+**修复（方案 2）**：0x00/非法 ACK/发送失败一律视为**连接级失败**——关闭连接重连后
+从 nackAt 起重发尾窗（重连天然清空陈旧 ACK 流；receiver 幂等写入 + 连续前缀
+lastSeq 去重保证不重复计数）。
+
+回归测试：`TestSenderPipelineNackFrameNeverCommitted`（seq=1 永远 0x00 → pending 恒
+保持 4、ack_ok 恒为 0、seq1 nack ≥3）。修复前该测试 pending 会掉到 0。
+
+### N2（P1）：OrderedSeq 门控与服务端实际窗口不一致
+
+`OrderedSeq = max_inflight > 1` 用原始配置值（默认 0→false），而服务端把 0 默认成 8
+→ 默认部署是"流水线服务端 + 非按序推进"，存在跨连接乱序完成吞重传帧的丢失路径。
+
+**修复**：seqTracker **恒开**（删除 OrderedSeq 配置项）。停等 sender 下前缀必然完整
+推进、行为不变；小缺口不再推进 last_seq，正确性由幂等重写兜底
+（`TestSeqSmallJumpAllowed` 更新为连续推进语义）。
+
+### N3（P1）：bit-rot 中段损坏截断整个尾部
+
+**修复**：indexSegment 遇无效记录先**向前重同步**找下一个合法帧头（记录长必须与
+帧头 Length 一致，`[u32 len] = HeaderSize + payload`）——跳过单帧而非整尾；重同步
+失败（真撕裂尾）才截断。`TestMidSegmentCorruptionSkipsSingleRecord`：坏帧跳过、
+前后帧完好、文件未被截断。
+
+### N4（P2）：seqTracker 溢出跳越的吞帧地雷
+
+**修复**：pending 超限时**只推进连续前缀** + 清空 pending（响亮 Error 日志），绝不
+跳越 last_seq；被清空的帧重传时幂等重写，正确性不受影响。
+
+### N5（P2）：ensureSchema 严格化可致同步永久停摆
+
+**修复**：元查询失败**不传播、不停摆**——降级为类型推断兜底（v1.3.1 行为）+ 30s
+负缓存短 TTL 后自动重试发现（成功条目仍 1h）。
+`TestSchemaDegradeOnMetaFailure` / `TestSchemaRecoversAfterMetaHeals`。
+
+### 小项
+
+| 项 | 修复 |
+|---|---|
+| dedup.CheckAndAdd 返回值被丢弃（LRU 废状态） | LRU 删除；新增 recv_inflight 在途帧指标 |
+| DLQ 文件名同 seq 秒内重试互相覆盖 | 文件名加 UnixNano 后缀 |
+| tcp_server ackDone 死代码 | 删除 |
+| "零分配"注释与实测不符 | 修正为"低分配"（Key 实测 2 allocs） |
+| runPipeline 每轮 go-back-N 重读盘 W×1MB | 窗口内只 PeekBatch 一次；nack 后尾窗复用不 refill |
+| 中继 DLQ 二级失败仅记日志 | relay.md 明示降级边界 |
+
+全部测试（含 -race）通过。
