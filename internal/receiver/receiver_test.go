@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -657,5 +658,61 @@ func TestGapNotClosedWhileInFlight(t *testing.T) {
 	}
 	if r.LastSeq() != 2 {
 		t.Fatalf("last_seq=%d, want 2 (1 completed + 2 pending run)", r.LastSeq())
+	}
+}
+
+// TestInflightRefCount 引用计数：同一 seq 并发在途两份（go-back-N 重发窗口），
+// 一份完成不误删另一份——双保险检查不低估在途。
+func TestInflightRefCount(t *testing.T) {
+	srv, _, _ := fakeTarget(t, false)
+	r := newTestReceiver(t, srv, Config{})
+	r.lastSeq.Store(4)
+	r.seqOrd.init(4)
+	// seq=5 在两条连接上并发在途
+	r.addInflight(5)
+	r.addInflight(5)
+	if r.tryCloseGap(6) {
+		t.Fatal("gap [5] must NOT close while seq 5 in-flight (refcount=2)")
+	}
+	r.removeInflight(5) // 一份完成：另一份仍在途
+	if r.tryCloseGap(6) {
+		t.Fatal("gap [5] must NOT close while one copy still in-flight (refcount=1)")
+	}
+	r.removeInflight(5) // 全部完成：允许闭合
+	if !r.tryCloseGap(6) {
+		t.Fatal("gap [5] must close after all copies complete")
+	}
+	if r.lastSeq.Load() != 5 {
+		t.Fatalf("last_seq=%d, want 5", r.lastSeq.Load())
+	}
+}
+
+// TestGapWarnReset 缺口闭合/推进后告警节流复位：后续真实跳变事件恢复 Warn 级。
+func TestGapWarnReset(t *testing.T) {
+	srv, _, _ := fakeTarget(t, false)
+	r := newTestReceiver(t, srv, Config{})
+	// 首次跳变：允许 Warn
+	if !r.gapWarnAllowed(10) {
+		t.Fatal("first jump must be warn-able")
+	}
+	r.markGapWarned(10)
+	// 同一缺口内再次跳变：节流
+	if r.gapWarnAllowed(11) {
+		t.Fatal("same gap must be throttled")
+	}
+	// last_seq 越过告警 seq（缺口闭合/推进）→ 新事件恢复 Warn
+	r.lastSeq.Store(10)
+	if !r.gapWarnAllowed(5000) {
+		t.Fatal("after gap closed, new jump must be warn-able again")
+	}
+	r.markGapWarned(5000)
+	// 同一缺口内：节流
+	if r.gapWarnAllowed(5001) {
+		t.Fatal("same gap must be throttled again")
+	}
+	// 时间窗复位：5 分钟后再允许
+	r.gapWarnedAt.Store(time.Now().Add(-gapWarnResetWindow - time.Second).UnixNano())
+	if !r.gapWarnAllowed(5001) {
+		t.Fatal("after reset window, warn must be allowed again")
 	}
 }

@@ -1,6 +1,6 @@
 # influx-sync
 
-InfluxDB 跨正向隔离同步系统（ISFP 协议，V1.4.2）。
+InfluxDB 跨正向隔离同步系统（ISFP 协议，V1.4.3）。
 
 **功能**：安全区 I 的 InfluxDB 1.x 数据 → 正向隔离装置（TCP 映射）→ 安全区 III 的 InfluxDB 1.x，
 单向、有序、At-Least-Once、断点续传同步。实测 **20 万点/s 实时零丢失**（64 核/124G，麒麟 V10）。
@@ -31,6 +31,7 @@ InfluxDB 跨正向隔离同步系统（ISFP 协议，V1.4.2）。
 | v1.4.0 | 性能审计修复：组帧重构（60x CPU）+ 边界去重 + checkpoint 节流 + group commit + WriteRaw + 传输调优 + single-flight schema + Receiver 流水线按序 ACK + 滑窗（实验项） + P0 修复（撕裂尾恢复/中继 DLQ/LRU 吞重试）+ e2e 延迟指标 |
 | v1.4.1 | 滑窗缺陷复审修复（N1-N5）：陈旧 ACK 错位提交（P0，连接级复位） + seqTracker 恒开 + 中段损坏跳单帧重同步 + 溢出不跳越 + schema 降级负缓存 + 6 个小项 |
 | v1.4.2 | 复审修复（N6-N8）：永久缺口发送方权威闭合（去告警刷屏/恢复去重） + seq 从 1 开始文档化 + schema 降级复用历史成功条目（防类型冲突毒丸） |
+| v1.4.3 | 收尾加固：inflightSeq 引用计数（双保险不低估在途） + gapWarned 闭合/时间窗复位（Error 级可观测性不丢失） |
 
 ## 目录
 

@@ -204,3 +204,22 @@ TestGapNotClosedWhileInFlight（阻塞式假库钉住"在途"状态）。
 回归测试：TestSchemaReuseLastGoodOnMetaFailure。
 
 全部测试（含 -race）通过。
+
+---
+
+## V1.4.3 修复记录（2026-08-14，收尾小项加固）
+
+### inflightSeq 引用计数（双保险不低估在途）
+
+同一 seq 在两条连接并发在途（go-back-N 重发窗口内真实存在）时，集合语义下先完成
+的一份 removeInflight 会误删另一份仍在途的标记，双保险检查低估在途。改
+map[uint64]int 引用计数：全部完成才移除。已证单 sender 拓扑下不影响正确性
+（闭合状态与在途缺口帧互斥），此项让多 sender 误配防御名副其实。
+
+### gapWarned 复位（Error 级可观测性不丢失）
+
+原实现首次跳变后永久只记 Debug——日后真实的 WAL 重置大跳跃事件不再有 Error 日志。
+改为双条件复位：缺口闭合/推进（last_seq 越过告警 seq）即复位；同一缺口持续时按
+5 分钟时间窗节流（刷屏可控、可观测性保留）。
+
+回归测试：TestInflightRefCount / TestGapWarnReset。全部测试（含 -race）通过。

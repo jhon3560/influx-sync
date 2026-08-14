@@ -45,9 +45,12 @@ type Receiver struct {
 	// 若 seq > lastSeq+1，说明 [lastSeq+1, seq-1] 已在 sender 侧 Commit
 	// （"0xff=已落库"保证它们完成于旧进程），可安全 markDone 闭合。
 	// 双保险：缺口区间必须全部不在途（防多 sender 误配场景）。
+	// inflightSeq 用引用计数：同一 seq 在两条连接并发在途（go-back-N 重发窗口
+	// 内真实存在）时，先完成的一份不会误删另一份的在途标记。
 	inflightMu  sync.Mutex
-	inflightSeq map[uint64]struct{} // 当前在途帧 seq
-	gapWarned   atomic.Uint64       // 上次 Warn 的缺口首帧 seq（日志节流）
+	inflightSeq map[uint64]int // 在途帧 seq -> 引用计数
+	gapWarned   atomic.Uint64  // 上次 Warn 的缺口首帧 seq（日志节流）
+	gapWarnedAt atomic.Int64   // 上次 Warn 时间（unixnano，时间窗复位用）
 
 	persistMu sync.Mutex
 	persistAt time.Time // last_seq 持久化节流（每秒最多一次）
@@ -65,7 +68,7 @@ func New(client *influx.Client, metrics *monitor.Metrics, logger *zap.Logger, cf
 		logger:      logger,
 		cfg:         cfg,
 		seqOrd:      newSeqTracker(),
-		inflightSeq: make(map[uint64]struct{}),
+		inflightSeq: make(map[uint64]int),
 	}
 	if cfg.LastSeqFile != "" {
 		seq, err := loadLastSeq(cfg.LastSeqFile)
@@ -117,18 +120,21 @@ func (r *Receiver) HandleFrame(connID uint64, frameIdx uint64, frameBytes []byte
 	if f.Seq > last+1 {
 		if f.Seq > last+seqJumpLimit {
 			// 大跳跃（双方持久化重置）：tracker 在 markDone 时直接越过；日志节流
-			if r.gapWarned.CompareAndSwap(0, f.Seq) {
+			if r.gapWarnAllowed(f.Seq) {
+				r.markGapWarned(f.Seq)
 				r.logger.Error("seq jump too large, frame accepted anyway (idempotent overwrite)",
 					zap.Uint64("seq", f.Seq), zap.Int64("last_seq", r.lastSeq.Load()))
 			} else {
 				r.logger.Debug("seq jump (repeated)", zap.Uint64("seq", f.Seq), zap.Int64("last_seq", r.lastSeq.Load()))
 			}
 		} else if frameIdx == 0 && r.tryCloseGap(f.Seq) {
+			r.gapWarned.Store(0) // 缺口闭合：复位告警节流（后续真实跳跃事件恢复 Error 级）
 			r.logger.Info("permanent seq gap closed via sender wal head",
 				zap.Uint64("seq", f.Seq), zap.Int64("last_seq", r.lastSeq.Load()), zap.Uint64("conn", connID))
 		} else {
 			// 无法安全闭合（在途冲突/非首帧）：日志节流，首条 Warn 后续 Debug
-			if r.gapWarned.CompareAndSwap(0, f.Seq) {
+			if r.gapWarnAllowed(f.Seq) {
+				r.markGapWarned(f.Seq)
 				r.logger.Warn("seq jump", zap.Uint64("seq", f.Seq), zap.Int64("last_seq", r.lastSeq.Load()))
 			} else {
 				r.logger.Debug("seq jump (repeated)", zap.Uint64("seq", f.Seq), zap.Int64("last_seq", r.lastSeq.Load()))
@@ -245,16 +251,47 @@ func (r *Receiver) markDone(seq uint64) {
 }
 
 // addInflight / removeInflight 维护在途帧集合（N6 缺口闭合双保险）。
+// 引用计数：同一 seq 并发在途多份（重发窗口内不同连接）时，逐份计数；
+// 全部完成才移除——保证双保险检查不低估在途。
 func (r *Receiver) addInflight(seq uint64) {
 	r.inflightMu.Lock()
-	r.inflightSeq[seq] = struct{}{}
+	r.inflightSeq[seq]++
 	r.inflightMu.Unlock()
 }
 
 func (r *Receiver) removeInflight(seq uint64) {
 	r.inflightMu.Lock()
-	delete(r.inflightSeq, seq)
+	if r.inflightSeq[seq] <= 1 {
+		delete(r.inflightSeq, seq)
+	} else {
+		r.inflightSeq[seq]--
+	}
 	r.inflightMu.Unlock()
+}
+
+// gapWarnResetWindow 同一缺口事件的 Warn 节流窗口：窗口过后允许再次 Warn
+// （避免 Error 级可观测性永久丢失）。
+const gapWarnResetWindow = 5 * time.Minute
+
+// gapWarnAllowed 判定本次跳变是否允许再记 Warn：
+//   - 从未告警过 → 允许；
+//   - 上次告警的 seq 已被 last_seq 越过（缺口已闭合/推进）→ 新事件，允许；
+//   - 同一缺口持续 → 时间窗节流（5 分钟一次）。
+func (r *Receiver) gapWarnAllowed(seq uint64) bool {
+	prev := r.gapWarned.Load()
+	if prev == 0 {
+		return true
+	}
+	if prev <= uint64(r.lastSeq.Load()) {
+		return true
+	}
+	return time.Since(time.Unix(0, r.gapWarnedAt.Load())) > gapWarnResetWindow
+}
+
+// markGapWarned 记录本次 Warn 的缺口首帧与时间。
+func (r *Receiver) markGapWarned(seq uint64) {
+	r.gapWarned.Store(seq)
+	r.gapWarnedAt.Store(time.Now().UnixNano())
 }
 
 // tryCloseGap 尝试闭合永久缺口（N6）：

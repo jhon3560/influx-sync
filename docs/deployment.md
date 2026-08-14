@@ -5,7 +5,7 @@
 ```
 /opt/influx-sync/
 ├── bin/
-│   ├── sender            # V1.4.2 静态二进制（CGO_ENABLED=0，兼容麒麟 V10 glibc 2.28）
+│   ├── sender            # V1.4.3 静态二进制（CGO_ENABLED=0，兼容麒麟 V10 glibc 2.28）
 │   ├── receiver
 │   └── *.bak             # 历史版本备份（升级前 cp 保留）
 ├── conf/
