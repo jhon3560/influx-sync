@@ -20,10 +20,11 @@ sync:
                         # 越小越实时；若源端写入延迟>watermark 有漏数风险（建议 ≥2s）
   max_window: 30s       # 单轮查询窗口上限（防时间跳变/积压一次拉爆）
   batch_points: 30000   # 单帧点数（原始 30000 点≈2.4MB；压缩后须 ≤1MB）
-                        # 若压缩后超限：V1.3.1 自动减半拆批，不会卡死
+                        # 若压缩后超限：自动减半拆批；单点仍超限则跳过该点并计数
   query_limit: 500000   # 单次查询 LIMIT（越大分页越少、扫描开销越低）
   poller_parallel: 4    # 并行查询/组帧 worker 数（0/1=串行）
   signal_listen: ":18098"  # 订阅信号监听（源库 SUBSCRIPTION 推送目标）；空=纯轮询
+  signal_min_interval: 200ms  # 信号最小查询间隔（V1.4：忙时信号延迟触发而非丢弃）
   backfill: 0s          # 首次启动回填时长（游标=now-watermark-backfill）
   tag_columns: []       # 显式 tag 列（空=自动 SHOW TAG KEYS 发现）
   measurements: []      # 同步的 measurement（空=全部 /.*/）
@@ -41,7 +42,10 @@ sender:
   max_retry: 10         # 连续失败告警阈值（不丢弃，见 architecture §4.3）
   backoff_base: 1s      # 重试退避基数（1s→2s→4s…）
   backoff_max: 60s      # 退避封顶
-  heartbeat_interval: 30s  # 空闲心跳（维持隔离通道活性）
+  heartbeat_interval: 30s  # 空闲心跳（维持隔离通道活性；心跳 seq 固定 0，不占数据 seq）
+  pipeline_window: 1    # 滑窗大小（A1 实验项）：1=停等（默认）。>1 时同连接多帧在途
+                        # （吞吐 ≈ W×batch/RTT）；开启前必须先与隔离装置确认允许
+                        # 同连接多请求在途，否则链路不通
 
 monitor:
   addr: :28080          # /metrics 端口（每实例独立）
@@ -68,6 +72,8 @@ target:
 tcp:
   listen: :28101                # 监听地址（必填；0.0.0.0=所有网卡，被动接收）
   read_timeout: 60s             # 单帧读取超时（> sender 心跳间隔 30s）
+  max_inflight: 8               # 每连接在途帧上限（A2 并发写库+按序 ACK 流水线）
+  max_conns: 0                  # 最大并发连接（0=不限制）
 
 dedup:
   cap: 10000                    # LRU 去重容量（in-flight 窗口）
@@ -79,7 +85,8 @@ dlq:
 relay:                          # 中继（V1.3，可选；不配置=无中继）
   addr: "198.51.100.x:28103"   # 下一跳 receiver 地址
   wal_dir: /opt/influx-sync/data/relay-wal  # 转发 WAL（必配，重启不丢）
-  timeout: 10s
+  timeout: 10s                  # 转发读写超时（V1.4：真正生效，原先被硬编码覆盖）
+  dlq_dir: ""                   # 转发失败转存目录（V1.4/C2）；空=默认 <wal_dir>/../relay_dlq
 
 monitor:  # 同 sender
   addr: :28080

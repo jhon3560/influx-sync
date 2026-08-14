@@ -2,6 +2,7 @@ package sender
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"time"
 
@@ -34,6 +35,8 @@ func (l *SignalListener) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if l.notify != nil {
 		l.notify()
 	}
+	// 排空 body（限制大小）：否则源侧 keep-alive 失效、连接 churn
+	_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, 1<<20))
 	w.WriteHeader(http.StatusNoContent)
 }
 

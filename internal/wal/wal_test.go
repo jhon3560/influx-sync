@@ -2,6 +2,7 @@ package wal
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -379,4 +380,197 @@ func TestOpenLockExclusive(t *testing.T) {
 		t.Fatalf("reopen after close: %v", err)
 	}
 	w2.Close()
+}
+
+// TestTornTailRecovery C1/P0：头完整+帧体撕裂（崩溃落在两次 Write 之间）
+// 必须截断尾部恢复，而不是 Open 失败导致进程起不来。
+func TestTornTailRecovery(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+	w, err := Open(walDir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 两帧正常落盘
+	seq1, err := w.Append(protocol.TypeData, []byte("m value=1 1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Append(protocol.TypeData, []byte("m value=2 2")); err != nil {
+		t.Fatal(err)
+	}
+	w.SetCursor(1000)
+	w.Close()
+
+	// 模拟撕裂：追加一段 [u32 len=200][帧体前半截]（头完整、体不完整）
+	f, err := os.OpenFile(segPath(walDir, 0), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var head [4]byte
+	binary.BigEndian.PutUint32(head[:], 200)
+	f.Write(head[:])
+	f.Write([]byte("partial frame body")) // 只有 18 字节
+	f.Close()
+
+	// 重开：必须成功，撕裂尾被截断，两帧完好
+	w2, err := Open(walDir, 0)
+	if err != nil {
+		t.Fatalf("open after torn tail must succeed: %v", err)
+	}
+	defer w2.Close()
+	if w2.PendingCount() != 2 {
+		t.Fatalf("pending=%d, want 2 (torn tail truncated)", w2.PendingCount())
+	}
+	s, _, err := w2.Peek()
+	if err != nil || s != seq1 {
+		t.Fatalf("peek seq=%d err=%v", s, err)
+	}
+	// 截断后仍可继续追加
+	seq3, err := w2.Append(protocol.TypeData, []byte("m value=3 3"))
+	if err != nil {
+		t.Fatalf("append after recovery: %v", err)
+	}
+	if seq3 != 3 {
+		t.Fatalf("seq3=%d", seq3)
+	}
+	// 重启后索引一致
+	w2.Close()
+	w3, err := Open(walDir, 0)
+	if err != nil {
+		t.Fatalf("reopen after recovery: %v", err)
+	}
+	defer w3.Close()
+	if w3.PendingCount() != 3 {
+		t.Fatalf("pending=%d after reopen", w3.PendingCount())
+	}
+}
+
+// TestTornHeadRecovery C1：头部分写入（1~3 字节）同样截断恢复。
+func TestTornHeadRecovery(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+	w, err := Open(walDir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Append(protocol.TypeData, []byte("m value=1 1")); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+
+	f, err := os.OpenFile(segPath(walDir, 0), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Write([]byte{0x00, 0x00}) // 2 字节撕裂头
+	f.Close()
+
+	w2, err := Open(walDir, 0)
+	if err != nil {
+		t.Fatalf("open after torn head must succeed: %v", err)
+	}
+	defer w2.Close()
+	if w2.PendingCount() != 1 {
+		t.Fatalf("pending=%d, want 1", w2.PendingCount())
+	}
+	seq, err := w2.Append(protocol.TypeData, []byte("m value=2 2"))
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if seq != 2 {
+		t.Fatalf("seq=%d", seq)
+	}
+}
+
+// TestCheckpointThrottled P3：Commit 路径的 checkpoint 持久化节流到每秒一次，
+// 段删除/SetCursor/Close 立即持久化。
+func TestCheckpointThrottled(t *testing.T) {
+	w := newTestWAL(t, 0)
+	seqs := make([]uint64, 0, 5)
+	for i := 0; i < 5; i++ {
+		s, err := w.Append(protocol.TypeData, []byte("m value=1 1"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		seqs = append(seqs, s)
+	}
+	w.SetCursor(100) // 立即持久化
+	first := w.lastCp
+	if first.IsZero() {
+		t.Fatal("SetCursor must persist immediately")
+	}
+	// 同一秒内多次 Commit：不得再次持久化（lastCp 不变）
+	for i := 0; i < 4; i++ {
+		if err := w.Commit(seqs[i]); err != nil {
+			t.Fatal(err)
+		}
+		if !w.lastCp.Equal(first) {
+			t.Fatalf("commit %d persisted checkpoint (throttle broken)", i)
+		}
+	}
+	// 关闭时最终持久化
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(w.dir, "checkpoint"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cp checkpoint
+	if err := json.Unmarshal(data, &cp); err != nil {
+		t.Fatal(err)
+	}
+	if cp.AckedBytes == 0 {
+		t.Fatal("checkpoint must reflect commits on Close")
+	}
+}
+
+// TestAppendBatchGroupCommit P4：多帧一次 fsync 落盘，重启后全部可恢复。
+func TestAppendBatchGroupCommit(t *testing.T) {
+	dir := t.TempDir()
+	walDir := filepath.Join(dir, "wal")
+	w, err := Open(walDir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var frames [][]byte
+	for i := 0; i < 10; i++ {
+		fb, err := protocol.Encode(protocol.TypeData, uint64(i+1), []byte(fmt.Sprintf("m value=%d %d", i, i)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		frames = append(frames, fb)
+	}
+	if err := w.AppendBatch(protocol.TypeData, 1, frames); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+	if w.PendingCount() != 10 {
+		t.Fatalf("pending=%d", w.PendingCount())
+	}
+	if w.NextSeq() != 11 {
+		t.Fatalf("next_seq=%d", w.NextSeq())
+	}
+	w.SetCursor(500)
+	w.Close()
+
+	w2, err := Open(walDir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w2.Close()
+	if w2.PendingCount() != 10 {
+		t.Fatalf("recovered pending=%d", w2.PendingCount())
+	}
+	fds, err := w2.PeekBatch(3)
+	if err != nil || len(fds) != 3 {
+		t.Fatalf("PeekBatch: %d %v", len(fds), err)
+	}
+	if fds[0].Seq != 1 || fds[2].Seq != 3 {
+		t.Fatalf("peek seqs=%d..%d", fds[0].Seq, fds[2].Seq)
+	}
+	// 乱序 seq 必须拒绝（顺序铁律）
+	if err := w2.AppendBatch(protocol.TypeData, 5, frames[:1]); err == nil {
+		t.Fatal("out-of-order batch must fail")
+	}
 }

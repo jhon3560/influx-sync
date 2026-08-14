@@ -17,6 +17,7 @@ import (
 	"influx-sync/internal/influx"
 	"influx-sync/internal/monitor"
 	"influx-sync/internal/protocol"
+	"influx-sync/internal/wal"
 )
 
 func testLogger(t *testing.T) *zap.Logger {
@@ -326,6 +327,195 @@ func TestTransientErrorRetries(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(dlqDir); len(entries) != 0 {
 		t.Fatalf("dlq must be empty, got %d files", len(entries))
+	}
+}
+
+// TestTransientFailureRetryNotSwallowed P0 回归：瞬时失败后重发同 seq 必须真正写库。
+// 修复前：LRU 在写库前登记 seq，重试帧被 "duplicate seq (lru)" 吞掉直接回 0xff，
+// 上游删除 WAL → 数据永久丢失（审计报告未覆盖，实测复现）。
+func TestTransientFailureRetryNotSwallowed(t *testing.T) {
+	var fail atomic.Bool
+	fail.Store(true)
+	var writes atomic.Int64
+	written := &sync.Map{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/write" {
+			http.NotFound(w, r)
+			return
+		}
+		writes.Add(1)
+		if fail.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		buf := make([]byte, 1<<20)
+		n, _ := r.Body.Read(buf)
+		written.Store("last", string(buf[:n]))
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	r := newTestReceiver(t, srv, Config{})
+	fb, _ := protocol.EncodeData(401, []byte("m value=1 1"))
+	if ack := r.HandleFrame(1, fb); ack != protocol.AckFail {
+		t.Fatalf("first ack=%x, want 0x00", ack)
+	}
+	fail.Store(false) // 目标库恢复
+	if ack := r.HandleFrame(1, fb); ack != protocol.AckSuccess {
+		t.Fatalf("retry ack=%x, want 0xff", ack)
+	}
+	if writes.Load() != 2 {
+		t.Fatalf("retry must actually write (writes=%d), data would be lost otherwise", writes.Load())
+	}
+	v, _ := written.Load("last")
+	if !strings.Contains(v.(string), "m value=1 1") {
+		t.Fatalf("retry payload mismatch: %q", v)
+	}
+	if r.LastSeq() != 401 {
+		t.Fatalf("last_seq=%d, want 401", r.LastSeq())
+	}
+}
+
+// TestRelayAppendFailureGoesToDLQ C2/P0 回归：中继 WAL append 失败时 raw lines
+// 落中继专用 DLQ（修复前仅记日志仍回 0xff，该帧对下一跳永久丢失）。
+func TestRelayAppendFailureGoesToDLQ(t *testing.T) {
+	srv, writeCount, _ := fakeTarget(t, false)
+	relayDLQ := filepath.Join(t.TempDir(), "relay_dlq")
+	walDir := filepath.Join(t.TempDir(), "relay_wal")
+	// 段大小 1 字节：首次 append 即触发 rotate；用占位目录占住 seg-000001.log
+	// 使 rotate 确定性失败（"is a directory"）
+	relayWAL, err := wal.Open(walDir, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relayWAL.Close()
+	if err := os.MkdirAll(filepath.Join(walDir, "seg-000001.log"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newTestReceiver(t, srv, Config{RelayWAL: relayWAL, RelayDLQDir: relayDLQ})
+	fb, _ := protocol.EncodeData(501, []byte("m value=1 1"))
+	// 写目标库成功 + 中继 append 失败：仍回 0xff（主链路畅通），但数据必须进 relay DLQ
+	if ack := r.HandleFrame(1, fb); ack != protocol.AckSuccess {
+		t.Fatalf("ack=%x, want 0xff", ack)
+	}
+	if writeCount.Load() != 1 {
+		t.Fatalf("target writes=%d", writeCount.Load())
+	}
+	entries, _ := os.ReadDir(relayDLQ)
+	if len(entries) != 1 {
+		t.Fatalf("relay dlq files=%d, want 1 (data must not be lost)", len(entries))
+	}
+	data, err := os.ReadFile(filepath.Join(relayDLQ, entries[0].Name()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta DLQMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatalf("relay dlq not valid json: %v", err)
+	}
+	if meta.SeqNum != 501 || meta.ErrorContext.Category != "RELAY_FORWARD_FAILURE" ||
+		meta.DataMetadata.SourceZone != "Zone_II" {
+		t.Fatalf("meta=%+v", meta)
+	}
+	if meta.PayloadGzipBase64 == "" {
+		t.Fatal("payload base64 missing")
+	}
+	if r.metrics.RelayDLQCount() != 1 {
+		t.Fatalf("relay dlq metric=%d", r.metrics.RelayDLQCount())
+	}
+}
+
+// TestLastPointTimestamp A5：最后一行的 ts 提取（零分配）。
+func TestLastPointTimestamp(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want int64
+	}{
+		{"m value=1 1720000000000000000\n", 1720000000000000000},
+		{"m value=1 1720000000000000000", 1720000000000000000},
+		{"m value=1 1\nm value=2 2\n", 2},
+		{"bad", 0},
+		{"", 0},
+		{"m value=1 x", 0},
+	}
+	for _, c := range cases {
+		if got := lastPointTimestamp([]byte(c.raw)); got != c.want {
+			t.Fatalf("lastPointTimestamp(%q)=%d, want %d", c.raw, got, c.want)
+		}
+	}
+}
+
+// TestSeqTrackerOrdered 并发流水线模式下 last_seq 只推进连续前缀。
+func TestSeqTrackerOrdered(t *testing.T) {
+	tr := newSeqTracker()
+	tr.init(0)
+	if tr.done(2) {
+		t.Fatal("seq 2 done before 1 must not advance")
+	}
+	if tr.load() != 0 {
+		t.Fatalf("last=%d", tr.load())
+	}
+	if !tr.done(1) || tr.load() != 2 {
+		t.Fatalf("after 1: last=%d, want 2", tr.load())
+	}
+	// 大跳跃直接越过
+	if !tr.done(100_000+10) || tr.load() != 100_000+10 {
+		t.Fatalf("big jump: last=%d", tr.load())
+	}
+}
+
+// TestOrderedReceiverNoAdvancePastInFlight A2 数据安全：帧 k+1 先完成不得推进
+// last_seq 越过在途的帧 k（否则 k 失败重传会被 seq<=last_seq 吞掉）。
+func TestOrderedReceiverNoAdvancePastInFlight(t *testing.T) {
+	// 按 payload 区分失败：value=1 的帧瞬时失败，其余成功
+	var writes atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/write" {
+			http.NotFound(w, r)
+			return
+		}
+		writes.Add(1)
+		buf := make([]byte, 1<<20)
+		n, _ := r.Body.Read(buf)
+		if strings.Contains(string(buf[:n]), "value=1") {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	r := newTestReceiver(t, srv, Config{OrderedSeq: true})
+	fb1, _ := protocol.EncodeData(1, []byte("m value=1 1"))
+	fb2, _ := protocol.EncodeData(2, []byte("m value=2 2"))
+	// 并发：帧 2 先完成，帧 1 失败
+	var wg sync.WaitGroup
+	var ack1, ack2 byte
+	wg.Add(2)
+	go func() { defer wg.Done(); ack1 = r.HandleFrame(1, fb1) }()
+	go func() { defer wg.Done(); ack2 = r.HandleFrame(1, fb2) }()
+	wg.Wait()
+	if ack1 != protocol.AckFail {
+		t.Fatalf("ack1=%x, want 0x00", ack1)
+	}
+	if ack2 != protocol.AckSuccess {
+		t.Fatalf("ack2=%x, want 0xff", ack2)
+	}
+	// 帧 2 完成但帧 1 在途：last_seq 不得越过 1
+	if r.LastSeq() != 0 {
+		t.Fatalf("last_seq=%d, must not advance past in-flight seq 1", r.LastSeq())
+	}
+	// 帧 1 重传成功 → last_seq 连续推进到 2
+	if ack := r.HandleFrame(1, fb1); ack != protocol.AckFail {
+		t.Fatalf("retry1 ack=%x (server still failing value=1)", ack)
+	}
+	if r.LastSeq() != 0 {
+		t.Fatalf("last_seq=%d after failed retry", r.LastSeq())
+	}
+	// 帧 2 重传（已被 LRU 去重）：不重复写、不破坏连续推进
+	if ack := r.HandleFrame(1, fb2); ack != protocol.AckSuccess {
+		t.Fatalf("dup2 ack=%x", ack)
+	}
+	if r.LastSeq() != 0 {
+		t.Fatalf("last_seq=%d, frame 1 still missing", r.LastSeq())
 	}
 }
 

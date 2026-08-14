@@ -348,7 +348,8 @@ func TestIsFrameTooLarge(t *testing.T) {
 	}
 }
 
-// TestAppendBatchSplitsOnTooLarge 验证超限帧自动拆批不卡死、不 panic。
+// TestAppendBatchSplitsOnTooLarge 验证超限帧自动拆批不卡死；
+// batch=1 仍超限的单点跳过并计数（C4：防游标永久卡死），好数据正常落盘。
 func TestAppendBatchSplitsOnTooLarge(t *testing.T) {
 	w, err := wal.Open(filepath.Join(t.TempDir(), "wal"), 0)
 	if err != nil {
@@ -359,16 +360,22 @@ func TestAppendBatchSplitsOnTooLarge(t *testing.T) {
 	metrics := monitor.New()
 	p := &Poller{wal: w, metrics: metrics, logger: log, cfg: PollerConfig{BatchPoints: 100, ParallelQueries: 2}}
 	// 单个点 17MB 字段值（> MaxDecompressedLen 16MB）：任何批量下编码必失败，
-	// 拆批应终止于错误返回（不卡死、不 panic，游标由上层保持）。
+	// 拆批到 batch=1 后跳过该点（不卡死、不 panic、不返回错误，游标可推进）。
 	big := strings.Repeat("x", 17<<20)
 	pts := make([]model.Point, 4)
 	for i := range pts {
 		pts[i] = model.Point{Measurement: "m", Fields: map[string]interface{}{"v": big}, Timestamp: int64(i + 1)}
 	}
-	if err := p.appendBatch(pts, 100); err == nil {
-		t.Fatal("expected too-large error even after split")
+	if err := p.appendBatch(pts, 100); err != nil {
+		t.Fatalf("expected skip (no error) for oversized single points, got %v", err)
 	}
-	// 回归验证：可编码的数据正常落盘
+	if metrics.SkipPointCount() != 4 {
+		t.Fatalf("skip count=%d, want 4", metrics.SkipPointCount())
+	}
+	if w.PendingCount() != 0 {
+		t.Fatalf("oversized points must not land in wal, pending=%d", w.PendingCount())
+	}
+	// 回归验证：可编码的数据正常落盘（与跳点共存）
 	ok := []model.Point{
 		{Measurement: "m", Fields: map[string]interface{}{"v": "a"}, Timestamp: 1},
 		{Measurement: "m", Fields: map[string]interface{}{"v": "b"}, Timestamp: 2},
@@ -378,5 +385,161 @@ func TestAppendBatchSplitsOnTooLarge(t *testing.T) {
 	}
 	if w.PendingCount() != 1 {
 		t.Fatalf("pending=%d", w.PendingCount())
+	}
+}
+
+// TestSenderPipeline A1：滑窗（Pipeline>1）下多帧在途、按序 ACK、全部提交。
+func TestSenderPipeline(t *testing.T) {
+	var received atomic.Int64
+	srv := transport.NewServer(transport.ServerConfig{Listen: "127.0.0.1:0", MaxInflight: 8}, func(id uint64, fb []byte) byte {
+		received.Add(1)
+		return protocol.AckSuccess
+	})
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	ctxSrv, cancelSrv := context.WithCancel(context.Background())
+	go srv.Serve(ctxSrv)
+	t.Cleanup(func() { cancelSrv(); srv.Close() })
+
+	w, m, _ := newTestEnv(t, "")
+	for i := 0; i < 12; i++ {
+		if _, err := w.Append(protocol.TypeData, []byte(fmt.Sprintf("m value=%d %d", i, i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client := transport.NewClient(transport.ClientConfig{Addr: srv.Addr().String(), Timeout: 2 * time.Second})
+	s := NewSender(w, client, m, testLogger(t), SenderConfig{
+		MaxRetry: 5, BackoffBase: 10 * time.Millisecond, BackoffMax: 50 * time.Millisecond,
+		IdleSleep: 10 * time.Millisecond, HeartbeatInterval: time.Hour, Pipeline: 4,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() { s.Run(ctx) }()
+	for i := 0; i < 250; i++ {
+		if w.PendingCount() == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if w.PendingCount() != 0 {
+		t.Fatalf("pipeline: pending=%d received=%d", w.PendingCount(), received.Load())
+	}
+	if received.Load() < 12 {
+		t.Fatalf("received=%d, want >= 12", received.Load())
+	}
+}
+
+// TestSenderPipelineGoBackN A1：窗口内第 1 帧 0x00 → go-back-N 重发 1..W 后全部提交。
+func TestSenderPipelineGoBackN(t *testing.T) {
+	var received atomic.Int64
+	var nacked atomic.Int64
+	srv := transport.NewServer(transport.ServerConfig{Listen: "127.0.0.1:0", MaxInflight: 8}, func(id uint64, fb []byte) byte {
+		received.Add(1)
+		f, err := protocol.Decode(fb)
+		if err != nil {
+			return protocol.AckFail
+		}
+		if f.Seq == 1 && nacked.Add(1) <= 1 {
+			return protocol.AckFail // seq=1 的帧 0x00（与处理顺序无关）
+		}
+		return protocol.AckSuccess
+	})
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	ctxSrv, cancelSrv := context.WithCancel(context.Background())
+	go srv.Serve(ctxSrv)
+	t.Cleanup(func() { cancelSrv(); srv.Close() })
+
+	w, m, _ := newTestEnv(t, "")
+	for i := 0; i < 4; i++ {
+		if _, err := w.Append(protocol.TypeData, []byte(fmt.Sprintf("m value=%d %d", i, i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	client := transport.NewClient(transport.ClientConfig{Addr: srv.Addr().String(), Timeout: 2 * time.Second})
+	s := NewSender(w, client, m, testLogger(t), SenderConfig{
+		MaxRetry: 5, BackoffBase: 10 * time.Millisecond, BackoffMax: 50 * time.Millisecond,
+		IdleSleep: 10 * time.Millisecond, HeartbeatInterval: time.Hour, Pipeline: 4,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() { s.Run(ctx) }()
+	for i := 0; i < 250; i++ {
+		if w.PendingCount() == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if w.PendingCount() != 0 {
+		t.Fatalf("go-back-N: pending=%d received=%d", w.PendingCount(), received.Load())
+	}
+	if received.Load() < 8 {
+		t.Fatalf("go-back-N should resend window (4+4), received=%d", received.Load())
+	}
+	if m.AckFailCount() == 0 {
+		t.Fatal("expected at least one nack")
+	}
+}
+
+// TestQueryParallelBoundaryDedup P2：边界 ts 重复点只出现一次；非边界点零损耗。
+func TestQueryParallelBoundaryDedup(t *testing.T) {
+	// 构造两个并行段：边界 ts=1000 的点在两段都返回（+1ns 重叠），归并后必须去重
+	boundary := int64(1000)
+	var queryCount atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/query" {
+			http.NotFound(w, r)
+			return
+		}
+		queryCount.Add(1)
+		q := r.URL.Query().Get("q")
+		if strings.HasPrefix(q, "SHOW TAG KEYS") {
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"m","columns":["tagKey"],"values":[]}]}]}`)
+			return
+		}
+		if strings.HasPrefix(q, "SHOW FIELD KEYS") {
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"m","columns":["fieldKey","fieldType"],"values":[["value","float"]]}]}]}`)
+			return
+		}
+		var start, end int64
+		fmt.Sscanf(q, "SELECT * FROM /.*/ WHERE time >= %dns AND time < %dns LIMIT %d", &start, &end)
+		var rows []string
+		step := int64(10)
+		for ts := start; ts < end; ts += step {
+			rows = append(rows, fmt.Sprintf(`[%d,"A01",%d]`, ts, ts))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"results":[{"series":[{"name":"m","columns":["time","plant","value"],"values":[%s]}]}]}`, strings.Join(rows, ","))
+	}))
+	defer srv.Close()
+	w, m, c := newTestEnv(t, srv.URL)
+	p := NewPoller(c, w, m, testLogger(t), PollerConfig{Window: time.Second, Watermark: time.Second, ParallelQueries: 2, MinSignalInterval: 100 * time.Millisecond})
+	start := boundary - 100
+	end := boundary + 100 // 段 0：[start,boundary+1)，段 1：[boundary,end)
+	pts, err := p.queryParallel(context.Background(), start, end)
+	if err != nil {
+		t.Fatalf("queryParallel: %v", err)
+	}
+	// 边界点只出现一次
+	count := 0
+	for _, pt := range pts {
+		if pt.Timestamp == boundary {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("boundary ts duplicates: %d, want 1", count)
+	}
+	// 无其他重复
+	seen := map[int64]int{}
+	for _, pt := range pts {
+		seen[pt.Timestamp]++
+	}
+	for ts, n := range seen {
+		if n != 1 {
+			t.Fatalf("ts %d appears %d times", ts, n)
+		}
 	}
 }

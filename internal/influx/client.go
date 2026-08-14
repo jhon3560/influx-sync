@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -32,8 +33,9 @@ type Client struct {
 	http    *http.Client
 	timeout time.Duration
 	// schema 自适应缓存：measurement -> tag 集合 + 字段类型（1 小时过期）
-	schemaMu    sync.Mutex
-	schemaCache map[string]*schemaEntry
+	schemaMu      sync.Mutex
+	schemaCache   map[string]*schemaEntry
+	schemaFlights map[string]*schemaCall // single-flight：并发去重 schema 发现
 }
 
 // schemaEntry 一个 measurement 的 schema 定义。
@@ -43,9 +45,28 @@ type schemaEntry struct {
 	fetchedAt time.Time
 }
 
+// schemaCall 一次进行中的 schema 发现（single-flight）。
+type schemaCall struct {
+	done  chan struct{}
+	entry *schemaEntry
+	err   error
+}
+
 const schemaCacheTTL = time.Hour
 
-// NewClient 创建客户端。timeout 为空时默认 10s。
+// WriteHTTPError 写库 HTTP 错误（带状态码，供错误分类器 typed 判断，
+// 替代解析错误文案）。
+type WriteHTTPError struct {
+	StatusCode int
+	Body       string
+}
+
+// Error 保持历史错误文案格式（日志/测试兼容）。
+func (e *WriteHTTPError) Error() string {
+	return fmt.Sprintf("influx: write http %d: %s", e.StatusCode, truncate(e.Body, 512))
+}
+
+// NewClient 创建客户端。timeout 为空时默认 10s（作为无 ctx 截止时间时的兜底）。
 func NewClient(cfg Config) (*Client, error) {
 	if cfg.URL == "" || cfg.Database == "" {
 		return nil, fmt.Errorf("influx: url and database required")
@@ -58,12 +79,35 @@ func NewClient(cfg Config) (*Client, error) {
 		}
 		d = parsed
 	}
+	// 传输调优：MaxIdleConnsPerHost ≥ 并行查询数（poller_parallel 默认 4），
+	// 避免每轮查询 2 条连接被丢弃重建；payload 已 gzip，关闭自动解压。
+	// Timeout 不再作为全局硬上限（大窗口回填会假失败）：由调用方按窗口动态
+	// 给 ctx 截止时间，本字段兜底 15 分钟防泄漏。
+	tr := &http.Transport{
+		MaxIdleConns:        64,
+		MaxIdleConnsPerHost: 16,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  true,
+	}
 	return &Client{
-		cfg:         cfg,
-		http:        &http.Client{Timeout: d},
-		timeout:     d,
-		schemaCache: make(map[string]*schemaEntry),
+		cfg:           cfg,
+		http:          &http.Client{Transport: tr, Timeout: 15 * time.Minute},
+		timeout:       d,
+		schemaCache:   make(map[string]*schemaEntry),
+		schemaFlights: make(map[string]*schemaCall),
 	}, nil
+}
+
+// do 执行请求；ctx 无截止时间时用 fallback 兜底（防无超时挂死）。
+func (c *Client) do(req *http.Request, fallback time.Duration) (*http.Response, error) {
+	ctx := req.Context()
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, fallback)
+		defer cancel()
+		req = req.WithContext(ctx)
+	}
+	return c.http.Do(req)
 }
 
 // queryResult Influx 1.x /query 响应结构。
@@ -88,8 +132,61 @@ type QueryOptions struct {
 	TagColumns   []string // 显式指定 tag 列（覆盖自动发现；空=自动 SHOW TAG KEYS）
 }
 
+// queryTimeout 按窗口大小给动态超时（大窗口回填/慢库不假失败）。
+// 30s 下限 + 2×窗口秒数，10 分钟封顶。
+func queryTimeout(start, end int64) time.Duration {
+	winSec := (end - start) / 1e9
+	if winSec < 0 {
+		winSec = 0
+	}
+	d := 30*time.Second + 2*time.Duration(winSec)*time.Second
+	if d > 10*time.Minute {
+		d = 10 * time.Minute
+	}
+	return d
+}
+
+// pointSet 边界去重集合：小集合零分配线性比较，大集合自动切换 Key 映射。
+type pointSet struct {
+	small []model.Point
+	big   map[string]struct{}
+}
+
+const pointSetLinearLimit = 8
+
+func (s *pointSet) add(p model.Point) {
+	if len(s.small) < pointSetLinearLimit {
+		s.small = append(s.small, p)
+		return
+	}
+	if s.big == nil {
+		s.big = make(map[string]struct{}, pointSetLinearLimit*4)
+		for _, q := range s.small {
+			s.big[q.Key()] = struct{}{}
+		}
+		s.small = nil
+	}
+	s.big[p.Key()] = struct{}{}
+}
+
+func (s *pointSet) contains(p model.Point) bool {
+	for _, q := range s.small {
+		if model.PointsEqual(q, p) {
+			return true
+		}
+	}
+	if s.big != nil {
+		_, ok := s.big[p.Key()]
+		return ok
+	}
+	return false
+}
+
 // QueryRange 查询 [start, end) 时间窗口内所有点（ns 精度）。
 // 内部按 LIMIT 分页推进，避免一次拉爆源库；返回的点按时间升序。
+//
+// 去重只覆盖分页边界时间戳（跨页同 timestamp 的行才可能重复返回）——
+// 相比全窗口 map 去重，省掉每点一次 Key() 构造与全量 map 内存。
 func (c *Client) QueryRange(ctx context.Context, start, end int64, opt QueryOptions) ([]model.Point, error) {
 	if opt.Limit <= 0 {
 		opt.Limit = 10000
@@ -97,9 +194,10 @@ func (c *Client) QueryRange(ctx context.Context, start, end int64, opt QueryOpti
 	if opt.MaxPages <= 0 {
 		opt.MaxPages = 1000
 	}
-	// 窗口内查重（跨分页边界同 timestamp 的行可能重复返回）
-	seen := make(map[string]struct{})
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout(start, end))
+	defer cancel()
 	var points []model.Point
+	var carried pointSet // 上一页边界 ts 的行（与新页开头重叠的部分）
 	for from := start; ; {
 		if from >= end {
 			break
@@ -112,15 +210,22 @@ func (c *Client) QueryRange(ctx context.Context, start, end int64, opt QueryOpti
 			break
 		}
 		lastTS := rows[len(rows)-1].Timestamp
+		// 去重只覆盖分页边界 ts（上一页末尾 = 本页开头 from）
 		for _, r := range rows {
 			if r.Timestamp >= end { // 防御：正常不会发生
 				continue
 			}
-			if _, dup := seen[r.Key()]; dup {
+			if r.Timestamp == from && from != start && carried.contains(r) {
 				continue
 			}
-			seen[r.Key()] = struct{}{}
 			points = append(points, r)
+		}
+		// 重建携带集：本页末尾 ts 的行，用于下一页开头去重
+		carried.reset()
+		for _, r := range rows {
+			if r.Timestamp == lastTS {
+				carried.add(r)
+			}
 		}
 		if len(rows) < opt.Limit {
 			break // 未取满，窗口结束
@@ -129,6 +234,10 @@ func (c *Client) QueryRange(ctx context.Context, start, end int64, opt QueryOpti
 			// 同一纳秒内行数超过 LIMIT：用 OFFSET 分页拉全该 ts 的行后推进
 			// （真实场景：批量导入工具可能共用时间戳；不处理会永久卡死）
 			offset := 0
+			dense := make(map[string]struct{})
+			for _, r := range rows {
+				dense[r.Key()] = struct{}{}
+			}
 			for {
 				big, err := c.queryOnce(ctx, lastTS, lastTS+1, QueryOptions{
 					Limit: opt.Limit * 10, Offset: offset,
@@ -141,10 +250,10 @@ func (c *Client) QueryRange(ctx context.Context, start, end int64, opt QueryOpti
 					if r.Timestamp != lastTS {
 						continue
 					}
-					if _, dup := seen[r.Key()]; dup {
+					if _, dup := dense[r.Key()]; dup {
 						continue
 					}
-					seen[r.Key()] = struct{}{}
+					dense[r.Key()] = struct{}{}
 					points = append(points, r)
 					added++
 				}
@@ -159,7 +268,7 @@ func (c *Client) QueryRange(ctx context.Context, start, end int64, opt QueryOpti
 			from = lastTS + 1
 			continue
 		}
-		from = lastTS // 从边界 ts 继续，边界行由 seen 去重
+		from = lastTS // 从边界 ts 继续，边界行由 carried 去重
 		if opt.MaxPages > 0 {
 			opt.MaxPages--
 			if opt.MaxPages == 0 {
@@ -168,6 +277,12 @@ func (c *Client) QueryRange(ctx context.Context, start, end int64, opt QueryOpti
 		}
 	}
 	return points, nil
+}
+
+// reset 清空去重集合（复用内存）。
+func (s *pointSet) reset() {
+	s.small = s.small[:0]
+	s.big = nil
 }
 
 // queryOnce 执行单次 SELECT 查询并解析。
@@ -182,7 +297,7 @@ func (c *Client) queryOnce(ctx context.Context, start, end int64, opt QueryOptio
 		return nil, fmt.Errorf("influx: build query: %w", err)
 	}
 	c.setAuth(req)
-	resp, err := c.http.Do(req)
+	resp, err := c.do(req, c.timeout)
 	if err != nil {
 		return nil, fmt.Errorf("influx: query %s [%d,%d): %w", opt.Measurements, start, end, err)
 	}
@@ -226,22 +341,66 @@ func (c *Client) queryOnce(ctx context.Context, start, end int64, opt QueryOptio
 }
 
 // ensureSchema 获取 measurement 的 schema 定义（tag keys + field 类型），带缓存。
-// 显式指定 tagColumns 时跳过自动发现；发现失败降级为旧行为（字符串→tag）。
+// 显式指定 tagColumns 时跳过 tag 自动发现。
+// single-flight：同一 measurement 的并发发现合并为一次 HTTP 往返；
+// 发现失败不缓存（下次查询重试），避免空 schema 缓存 1 小时导致类型写错。
 func (c *Client) ensureSchema(ctx context.Context, measurement string, tagColumns []string) (*schemaEntry, error) {
 	c.schemaMu.Lock()
-	defer c.schemaMu.Unlock()
 	if e, ok := c.schemaCache[measurement]; ok && time.Since(e.fetchedAt) < schemaCacheTTL {
+		c.schemaMu.Unlock()
 		return e, nil
 	}
+	if call, ok := c.schemaFlights[measurement]; ok {
+		// 已有并发发现在途：等待其完成（或 ctx 取消）
+		c.schemaMu.Unlock()
+		select {
+		case <-call.done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		c.schemaMu.Lock()
+		if e, ok := c.schemaCache[measurement]; ok && time.Since(e.fetchedAt) < schemaCacheTTL {
+			c.schemaMu.Unlock()
+			return e, nil
+		}
+		c.schemaMu.Unlock()
+		if call.err != nil {
+			return nil, call.err
+		}
+		return nil, fmt.Errorf("influx: schema discovery of %s failed", measurement)
+	}
+	call := &schemaCall{done: make(chan struct{})}
+	c.schemaFlights[measurement] = call
+	c.schemaMu.Unlock()
+
+	entry, err := c.fetchSchema(ctx, measurement, tagColumns)
+
+	c.schemaMu.Lock()
+	delete(c.schemaFlights, measurement)
+	if err == nil {
+		entry.fetchedAt = time.Now()
+		c.schemaCache[measurement] = entry
+	}
+	call.entry, call.err = entry, err
+	close(call.done)
+	c.schemaMu.Unlock()
+	return entry, err
+}
+
+// fetchSchema 执行 SHOW TAG KEYS / SHOW FIELD KEYS（不持锁，不缓存）。
+func (c *Client) fetchSchema(ctx context.Context, measurement string, tagColumns []string) (*schemaEntry, error) {
 	e := &schemaEntry{tags: map[string]bool{}, fieldType: map[string]string{}}
 	if len(tagColumns) > 0 {
 		for _, k := range tagColumns {
 			e.tags[k] = true
 		}
 	}
+	var errs []error
 	// SHOW TAG KEYS
 	if len(tagColumns) == 0 {
-		if rows, err := c.queryMeta(ctx, fmt.Sprintf(`SHOW TAG KEYS FROM %q`, measurement)); err == nil {
+		if rows, err := c.queryMeta(ctx, fmt.Sprintf(`SHOW TAG KEYS FROM %q`, measurement)); err != nil {
+			errs = append(errs, fmt.Errorf("show tag keys: %w", err))
+		} else {
 			for _, row := range rows {
 				if len(row) > 0 {
 					if k, ok := row[0].(string); ok {
@@ -252,7 +411,9 @@ func (c *Client) ensureSchema(ctx context.Context, measurement string, tagColumn
 		}
 	}
 	// SHOW FIELD KEYS（含类型）
-	if rows, err := c.queryMeta(ctx, fmt.Sprintf(`SHOW FIELD KEYS FROM %q`, measurement)); err == nil {
+	if rows, err := c.queryMeta(ctx, fmt.Sprintf(`SHOW FIELD KEYS FROM %q`, measurement)); err != nil {
+		errs = append(errs, fmt.Errorf("show field keys: %w", err))
+	} else {
 		for _, row := range rows {
 			if len(row) >= 2 {
 				if k, ok := row[0].(string); ok {
@@ -263,8 +424,9 @@ func (c *Client) ensureSchema(ctx context.Context, measurement string, tagColumn
 			}
 		}
 	}
-	e.fetchedAt = time.Now()
-	c.schemaCache[measurement] = e
+	if len(errs) > 0 {
+		return nil, fmt.Errorf("influx: schema discovery of %s: %v", measurement, errs)
+	}
 	return e, nil
 }
 
@@ -276,7 +438,7 @@ func (c *Client) queryMeta(ctx context.Context, q string) ([][]interface{}, erro
 		return nil, err
 	}
 	c.setAuth(req)
-	resp, err := c.http.Do(req)
+	resp, err := c.do(req, 15*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -339,6 +501,7 @@ func validMeasurement(m string) bool {
 
 // seriesToPoints 将 Influx series 行转换为 Point。
 // 列分类依据发现的 schema：tag keys → Tag；其余按字段类型 → Field（integer→int64）。
+// 键序（tag/field 排序）在 series 级计算一次，注入全部点共享（组帧/查重零排序）。
 func seriesToPoints(name string, columns []string, values [][]interface{}, schema *schemaEntry) ([]model.Point, error) {
 	if len(columns) == 0 {
 		return nil, nil
@@ -353,6 +516,22 @@ func seriesToPoints(name string, columns []string, values [][]interface{}, schem
 	if timeIdx < 0 {
 		return nil, fmt.Errorf("no time column in %s", name)
 	}
+	// series 级预排序键序（Influx 同 series 列序稳定，缓存一次全行复用）
+	tagCols := make([]string, 0, len(columns))
+	fieldCols := make([]string, 0, len(columns))
+	for _, col := range columns {
+		if col == "time" {
+			continue
+		}
+		if schema != nil && schema.tags[col] {
+			tagCols = append(tagCols, col)
+		} else {
+			fieldCols = append(fieldCols, col)
+		}
+	}
+	sort.Strings(tagCols)
+	sort.Strings(fieldCols)
+
 	points := make([]model.Point, 0, len(values))
 	for _, row := range values {
 		if len(row) != len(columns) {
@@ -415,6 +594,7 @@ func seriesToPoints(name string, columns []string, values [][]interface{}, schem
 		if len(p.Fields) == 0 {
 			return nil, fmt.Errorf("row at %v has no fields", row[timeIdx])
 		}
+		p.SetKeyOrder(tagCols, fieldCols)
 		points = append(points, p)
 	}
 	return points, nil
@@ -482,26 +662,35 @@ func toBool(v interface{}) bool {
 }
 
 // WriteLines 批量写入 Line Protocol（HTTP /write, precision=ns）。
+// 保留 []string 接口（测试/兼容），内部走 WriteRaw。
 func (c *Client) WriteLines(ctx context.Context, lines []string) error {
 	if len(lines) == 0 {
 		return nil
 	}
-	body := strings.Join(lines, "\n")
+	return c.WriteRaw(ctx, []byte(strings.Join(lines, "\n")))
+}
+
+// WriteRaw 直接写入原始 Line Protocol 字节（P5：省掉拆行→拼串往返，
+// 解压出的 payload 本身就是合法 LP）。失败返回 *WriteHTTPError（4xx/5xx）。
+func (c *Client) WriteRaw(ctx context.Context, raw []byte) error {
+	if len(raw) == 0 {
+		return nil
+	}
 	u := fmt.Sprintf("%s/write?db=%s&precision=ns", c.cfg.URL, url.QueryEscape(c.cfg.Database))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(raw))
 	if err != nil {
 		return fmt.Errorf("influx: build write: %w", err)
 	}
 	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
 	c.setAuth(req)
-	resp, err := c.http.Do(req)
+	resp, err := c.do(req, c.timeout)
 	if err != nil {
-		return fmt.Errorf("influx: write %d lines: %w", len(lines), err)
+		return fmt.Errorf("influx: write %d bytes: %w", len(raw), err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("influx: write http %d: %s", resp.StatusCode, truncate(string(msg), 512))
+		return &WriteHTTPError{StatusCode: resp.StatusCode, Body: string(msg)}
 	}
 	return nil
 }

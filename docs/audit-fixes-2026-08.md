@@ -42,3 +42,71 @@
 - `go build ./...` / `go vet ./...` 通过
 - `go test ./...` 全部通过（新增回归测试：DLQ 偏移、解压超限、NaN/转义、拆批、seq 跳跃新语义）
 - `go test -race ./internal/...` 全部通过
+
+---
+
+## V1.4 修复记录（2026-08-14，外部审计报告 + 修复实施）
+
+审计报告覆盖 3709 行代码 + 全套文档，实测热点路径（组帧 329ms/万点、747MB 分配）。
+全部问题经代码逐项确认属实后修复；另发现审计未覆盖的 1 个 P0 数据丢失缺陷。
+
+### 审计报告之外发现的 P0（实测复现）
+
+| # | 问题 | 修复 |
+|---|---|---|
+| X1 | Receiver 的 LRU 去重在**写库之前**登记 seq：瞬时失败（500）回 0x00 → Sender 重发同 seq → 被 LRU 吞掉直接回 0xff → 上游删除 WAL → 数据永久丢失（实测：writes=1, ack=ff） | 去重登记移到写库成功之后；`TestTransientFailureRetryNotSwallowed` 回归测试 |
+
+### 审计报告 P0 项
+
+| # | 报告项 | 修复 |
+|---|---|---|
+| C1 | WAL 撕裂尾部（头完整+帧体撕裂）→ Open 失败进程起不来 | indexSegment 首个无效记录视为撕裂尾：截断 + Error 日志 + 继续（`TestTornTailRecovery`/`TestTornHeadRecovery`） |
+| C2 | 中继 WAL append 失败仅记日志仍回 0xff → 对下一跳永久丢失 | 失败时 raw lines 落中继专用 DLQ（relay.dlq_dir，默认 <wal_dir>/../relay_dlq）+ relay_dlq_total 指标（`TestRelayAppendFailureGoesToDLQ`） |
+
+### 审计报告 P1 性能项（实测基准）
+
+| # | 报告项 | 修复 | 实测收益 |
+|---|---|---|---|
+| P1 | LineProtocol sort×2 + NewReplacer×4 + Sprintf×3 | 包级转义循环 + strconv.Append* + 缓存键序 + []byte 拼装 | 32900ns/85 分配 → **544ns/2 分配**（~60x CPU / ~40x 分配） |
+| P2 | 每点 Key()（684ns/7 分配）且查询路径调用两次 + 双份全窗口 map | Key 零分配化（352ns/2 分配）+ QueryRange/queryParallel 改为仅边界 ts 去重（小集合线性比较，零分配） | 全窗口 map 与双份 Key() 消除 |
+| P3 | checkpoint 每次 ACK 全量持久化（2 fsync+rename+目录 fsync，5.4ms/次） | Commit 路径节流 1s/次；段删除/SetCursor/Close 立即持久化（`TestCheckpointThrottled`） | 省 ~110ms/s 盘 IO |
+| P4 | 每帧 fsync（3.3ms/帧）且持锁阻塞 Peek | AppendBatch group commit：每轮 poll 一次 fsync；先 WAL 后游标不变（`TestAppendBatchGroupCommit`） | 帧率翻倍不再是瓶颈 |
+| P5 | 解压→拆行→拼回往返（1.3ms/帧 + 1.85MB 分配/帧） | influx.WriteRaw 直接整体写入；splitLines 仅失败/DLQ 路径使用 | 热路径零拆拼 |
+| P6 | 默认 http.Client（MaxIdleConnsPerHost=2 < poller_parallel=4）+ 固定 10s 全局超时 | Transport 调优（16/主机）；查询按窗口动态 ctx 超时（30s+2×窗口，10min 封顶）；写库保留动态超时 | 大窗口回填不再假失败 |
+| P7 | ensureSchema 持全局锁做网络请求 + 失败缓存空 schema 1h | 按 measurement single-flight；失败不缓存并报错（游标保持重试） | 并发 worker 不再互阻；类型不再错 1 小时 |
+
+### 架构/实时性项
+
+| # | 报告项 | 修复 |
+|---|---|---|
+| A1 | 停等协议吞吐上限（batch/RTT） | 滑窗实现（sender.pipeline_window，默认 1=停等；go-back-N）；**开启前须与隔离装置确认同连接多请求在途**（`TestSenderPipeline`/`TestSenderPipelineGoBackN`） |
+| A2 | Receiver ACK 路径全串行，写库 RTT 计入链路 RTT | 每连接流水线：并发 handler + 按序 ACK（0xff=已落库语义不变，wire 兼容停等 sender）（`TestServerOrderedAckUnderConcurrency`）；OrderedSeq 模式 last_seq 只推进连续前缀，防跳序吞重试 |
+| A3 | 订阅信号忙时丢弃 + 空闲 Sleep(200ms) 首帧延迟 | pending-flag + MinSignalInterval 延迟触发；WAL append 通知通道唤醒 Sender 空闲等待 |
+| A5 | 无端到端延迟指标 | receiver 提取帧末点时间戳 → sync_e2e_delay_seconds |
+
+### 其余修复
+
+| # | 项 | 修复 |
+|---|---|---|
+| C3 | classifyWriteError 解析错误文案 | influx.WriteHTTPError typed error + errors.As（字符串解析仅兼容路径） |
+| C4 | batch=1 单点超限 → 游标永久卡死 | 跳过该点 + point_skip_total 计数（`TestAppendBatchSplitsOnTooLarge`） |
+| C5 | relay.timeout 配置从未生效 | 硬编码 10s 改为 cfg.RelayTimeout() |
+| 🟢 | 心跳复用数据 seq 空间 | 心跳 seq 固定 0 |
+| 🟢 | SignalListener 不读 body | io.Copy(io.Discard, LimitReader 1MB) 后再 204 |
+| 🟢 | monitor HTTP 无超时 | ReadTimeout 15s / ReadHeaderTimeout 5s |
+| 🟢 | tcp_server 无连接上限 / 每帧 2 次 make | max_conns 配置 + 单次分配 Header+Payload |
+| 🟢 | config.dur 静默回退 / 负 interval 不校验 | Validate 严格校验（解析失败/负值报错） |
+| 🟢 | MinSignalInterval 未从 YAML 传入 | signal_min_interval 接线 + 测试 |
+| 🟢 | Sender 重试每次 Peek 重读盘 + 分配 1MB | 最后 Peek 帧缓存（同 seq 复用） |
+| 🟢 | 组帧 benchmark 回归守卫 | BenchmarkLineProtocol/LinesToProtocolBytes/PointKey/PointsEqual |
+
+### 基准实测（Ryzen 4800H，V1.4 修复后）
+
+```
+BenchmarkLineProtocol-16          544.4 ns/op    256 B/op   2 allocs/op   （修复前 ~33µs/85 allocs）
+BenchmarkPointKey-16              351.6 ns/op    144 B/op   2 allocs/op   （修复前 684ns/7 allocs）
+BenchmarkPointsEqual-16            14.0 ns/op      0 B/op   0 allocs/op
+BenchmarkLinesToProtocolBytes-16  5.84 ms/万点    5.2MB/万点
+```
+
+全部测试（含 -race）通过；新增回归测试 20+ 个。

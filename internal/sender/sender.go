@@ -19,10 +19,13 @@ type SenderConfig struct {
 	BackoffBase       time.Duration // 退避基数，默认 1s
 	BackoffMax        time.Duration // 退避上限，默认 60s
 	HeartbeatInterval time.Duration // 心跳间隔，默认 30s
-	IdleSleep         time.Duration // 空闲轮询间隔，默认 200ms
+	IdleSleep         time.Duration // 空闲轮询间隔（WAL 通知失效时的兜底），默认 200ms
+	Pipeline          int           // 滑窗大小（A1 实验项），默认 1=停等。>1 时同连接多帧在途
 }
 
 // Sender 停等发送器：WAL 取帧 → TCP 发送 → 等 ACK → 提交/重试/DLQ。
+// Pipeline>1 时进入滑窗模式（go-back-N）：吞吐 = W×batch/RTT，
+// 需与隔离装置确认允许同连接多请求在途后再开启。
 type Sender struct {
 	wal     *wal.WAL
 	client  *transport.Client
@@ -48,6 +51,9 @@ func NewSender(w *wal.WAL, client *transport.Client, metrics *monitor.Metrics, l
 	if cfg.IdleSleep <= 0 {
 		cfg.IdleSleep = 200 * time.Millisecond
 	}
+	if cfg.Pipeline <= 0 {
+		cfg.Pipeline = 1
+	}
 	return &Sender{wal: w, client: client, metrics: metrics, logger: logger, cfg: cfg}
 }
 
@@ -55,6 +61,10 @@ func NewSender(w *wal.WAL, client *transport.Client, metrics *monitor.Metrics, l
 func (s *Sender) Run(ctx context.Context) {
 	retryCount := 0
 	lastHeartbeat := time.Now()
+	// 最后 Peek 帧缓存：重试/重发时避免每次重读盘 + 分配（小项加固）
+	var cachedSeq uint64
+	var cachedBytes []byte
+	haveCache := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -71,14 +81,32 @@ func (s *Sender) Run(ctx context.Context) {
 					s.sendHeartbeat()
 					lastHeartbeat = time.Now()
 				}
-				time.Sleep(s.cfg.IdleSleep)
+				// A3：WAL append 通知优先唤醒（新数据零延迟）；IdleSleep 仅为兜底
+				select {
+				case <-ctx.Done():
+					return
+				case <-s.wal.NotifyCh():
+				case <-time.After(s.cfg.IdleSleep):
+				}
 				continue
 			}
 			s.logger.Error("wal peek failed", zap.Error(err))
-			time.Sleep(s.cfg.IdleSleep)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(s.cfg.IdleSleep):
+			}
 			continue
 		}
 		s.metrics.SetWALPending(int64(s.wal.PendingCount()))
+
+		// 重试同帧时复用缓存（Peek 每次持锁读盘，且 1MB 分配）
+		if haveCache && cachedSeq == seq {
+			frameBytes = cachedBytes
+		} else {
+			cachedSeq, cachedBytes = seq, frameBytes
+			haveCache = true
+		}
 
 		backoff := s.backoff(retryCount)
 		if retryCount > 0 {
@@ -94,6 +122,11 @@ func (s *Sender) Run(ctx context.Context) {
 			s.logger.Warn("connect failed", zap.Error(err))
 			s.metrics.IncRetry()
 			retryCount++
+			continue
+		}
+
+		if s.cfg.Pipeline > 1 {
+			retryCount = s.runPipeline(ctx, seq, frameBytes, retryCount)
 			continue
 		}
 
@@ -138,9 +171,118 @@ func (s *Sender) Run(ctx context.Context) {
 	}
 }
 
+// runPipeline 滑窗发送一轮（A1 实验项，Pipeline>1）：连续发 W 帧后按序读回
+// W 个 ACK；第 k 个 0x00 触发 go-back-N（从 k 起重发）。返回更新后的 retryCount。
+// 协议兼容：每个帧仍恰好对应一个响应字节，只是同连接多帧在途。
+func (s *Sender) runPipeline(ctx context.Context, seq uint64, frameBytes []byte, retryCount int) int {
+	w := s.cfg.Pipeline
+	frames := []wal.FrameData{{Seq: seq, Bytes: frameBytes}}
+	// 批量 Peek 剩余窗口帧（无则不阻塞）
+	if more, err := s.wal.PeekBatch(w); err == nil {
+		frames = more
+	}
+	for {
+		// 发送全部在途帧
+		for i, f := range frames {
+			select {
+			case <-ctx.Done():
+				return retryCount
+			default:
+			}
+			if i > 0 {
+				backoff := s.backoff(retryCount)
+				if retryCount > 0 {
+					s.logger.Info("pipeline retry", zap.Uint64("seq", f.Seq), zap.Int("retry", retryCount), zap.Duration("backoff", backoff))
+				}
+				select {
+				case <-ctx.Done():
+					return retryCount
+				case <-time.After(backoff):
+				}
+			}
+			s.metrics.IncSend()
+			if err := s.client.SendFrame(f.Bytes); err != nil {
+				s.logger.Warn("pipeline send failed", zap.Uint64("seq", f.Seq), zap.Error(err))
+				s.metrics.IncRetry()
+				retryCount++
+				if retryCount > s.cfg.MaxRetry {
+					retryCount = s.cfg.MaxRetry
+				}
+				continue
+			}
+		}
+		// 按序读回 ACK：0x00 处从该帧起重发（go-back-N）
+		nackAt := -1
+		for i := range frames {
+			ack, err := s.client.WaitAck()
+			if err != nil {
+				s.logger.Warn("pipeline ack wait failed", zap.Uint64("seq", frames[i].Seq), zap.Error(err))
+				s.metrics.IncRetry()
+				retryCount++
+				if retryCount > s.cfg.MaxRetry {
+					retryCount = s.cfg.MaxRetry
+				}
+				nackAt = i
+				break
+			}
+			switch ack {
+			case protocol.AckSuccess:
+				if err := s.wal.Commit(frames[i].Seq); err != nil {
+					s.logger.Error("wal commit failed", zap.Uint64("seq", frames[i].Seq), zap.Error(err))
+					continue
+				}
+				s.metrics.IncAckOk()
+				s.logger.Info("pipeline ack success", zap.Uint64("seq", frames[i].Seq))
+				retryCount = 0
+			case protocol.AckFail:
+				s.metrics.IncAckFail()
+				retryCount++
+				if retryCount >= s.cfg.MaxRetry {
+					s.logger.Error("frame keep retrying (nack threshold reached, NOT dropped)",
+						zap.Uint64("seq", frames[i].Seq), zap.Int("retries", retryCount))
+					retryCount = s.cfg.MaxRetry
+				}
+				nackAt = i
+				// 丢弃 i 之后的已读 ACK 无需处理：receiver 按序回 ACK，
+				// go-back-N 重发 i..W-1，receiver 会重新回全部 ACK
+			default:
+				s.logger.Warn("invalid ack byte", zap.Uint64("seq", frames[i].Seq), zap.Uint8("ack", ack))
+				retryCount++
+				nackAt = i
+			}
+			if nackAt >= 0 {
+				break
+			}
+		}
+		if nackAt < 0 {
+			return retryCount // 全窗确认完成
+		}
+		// go-back-N：从 nackAt 重发，并补足窗口
+		if err := s.client.EnsureConnected(); err != nil {
+			s.logger.Warn("pipeline reconnect failed", zap.Error(err))
+			s.metrics.IncRetry()
+			retryCount++
+			if retryCount > s.cfg.MaxRetry {
+				retryCount = s.cfg.MaxRetry
+			}
+		}
+		frames = frames[nackAt:]
+		if more, err := s.wal.PeekBatch(w); err == nil {
+			// 补窗口：确保 frames 覆盖从 nackAt 起的在途帧（同 seq 重发）
+			if len(more) > len(frames) {
+				// PeekBatch 从头返回：只要 seq 前缀一致，取前缀重发 + 新帧
+				if more[0].Seq == frames[0].Seq {
+					frames = more
+				}
+			}
+		}
+	}
+}
+
 // sendHeartbeat 发送心跳帧（失败仅告警，不重试）。
+// 心跳 seq 固定为 0（不消耗数据帧 seq 空间，避免语义混淆）。
 func (s *Sender) sendHeartbeat() {
-	fb, err := protocol.EncodeHeartbeat(s.wal.NextSeq())
+	fb, err := protocol.EncodeHeartbeat(0)
 	if err != nil {
 		return
 	}

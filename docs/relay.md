@@ -30,6 +30,7 @@ relay:
 | 转发内容 | 写库成功后的原始 Line Protocol（独立 seq 重新编号） |
 | 可靠性 | 转发走**独立 WAL**，复用标准 Sender（停等 ACK / 断点续传 / At-Least-Once） |
 | ACK 语义 | B 写库成功即 ACK 上游（对 A 快）；转发异步，失败由转发 WAL 缓冲重试 |
+| 转发 append 失败 | V1.4/C2：raw lines 落中继专用 DLQ（`relay.dlq_dir`，默认 `<wal_dir>/../relay_dlq`）+ `relay_dlq_total` 指标——**不再存在静默丢失路径** |
 | 毒丸 | 写库失败进 DLQ 的帧**不转发**（避免下游同样落 DLQ） |
 | 吞吐 | B 同时承受写库+转发（带宽约为单链路 2 倍） |
 

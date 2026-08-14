@@ -3,6 +3,7 @@ package sender
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sort"
@@ -54,8 +55,9 @@ const (
 )
 
 // Poller 时间窗口轮询器：查询源 Influx → 组帧 → 写 WAL → 推进游标。
-// V1.2 支持订阅信号触发：源库 SUBSCRIPTION 推送到达时立即查询（信号合并，
-// 不解析内容；丢失时由兜底 ticker 保证不漏）。
+// V1.2 支持订阅信号触发：源库 SUBSCRIPTION 推送到达时立即查询。
+// V1.4 信号不丢弃：忙时置 pending-flag + MinSignalInterval 短定时器延迟触发
+// （信号路径尾部延迟从 ≤1s 降到 ≤200ms），丢失时由兜底 ticker 保证不漏。
 type Poller struct {
 	client  *influx.Client
 	wal     *wal.WAL
@@ -63,8 +65,10 @@ type Poller struct {
 	logger  *zap.Logger
 	cfg     PollerConfig
 
-	signalCh        chan struct{} // 订阅信号（cap=1，合并语义：忙时丢弃新信号）
-	lastPoll        time.Time     // 上次查询时间（最小信号间隔护栏）
+	signalCh        chan struct{} // 信号触发通道（由延迟定时器投递）
+	signalPending   atomic.Bool   // 有信号待触发（合并语义）
+	signalTimer     *time.Timer   // 信号延迟触发定时器（MinSignalInterval 护栏）
+	lastPoll        atomic.Int64  // 上次查询时间（unixnano，原子防竞态）
 	wakeupScheduled atomic.Bool   // watermark 解锁自唤醒定时器是否已安排（原子，防竞态）
 }
 
@@ -94,21 +98,49 @@ func NewPoller(client *influx.Client, w *wal.WAL, metrics *monitor.Metrics, logg
 	if cfg.MinSignalInterval <= 0 {
 		cfg.MinSignalInterval = 200 * time.Millisecond
 	}
-	return &Poller{client: client, wal: w, metrics: metrics, logger: logger, cfg: cfg, signalCh: make(chan struct{}, 1)}
+	return &Poller{
+		client:      client,
+		wal:         w,
+		metrics:     metrics,
+		logger:      logger,
+		cfg:         cfg,
+		signalCh:    make(chan struct{}, 1),
+		signalTimer: time.NewTimer(time.Hour), // 初始长定时器，避免首帧误触发
+	}
 }
 
-// Notify 订阅信号回调：非阻塞发信号（cap=1 天然合并，Poller 忙时丢弃）。
+// Notify 订阅信号回调：非阻塞，合并语义。
+// 信号不被丢弃：置 pending-flag 并安排 MinSignalInterval 后触发——
+// 即使 Poller 忙，短定时器到点后也会补一次查询（延迟 ≤ MinSignalInterval）。
 func (p *Poller) Notify() {
-	select {
-	case p.signalCh <- struct{}{}:
-	default:
-		// 已有待处理信号或 Poller 忙：丢弃（合并），不影响正确性
+	if !p.signalPending.CompareAndSwap(false, true) {
+		return // 已有待触发信号：合并
 	}
+	d := p.cfg.MinSignalInterval - time.Duration(time.Now().UnixNano()-p.lastPoll.Load())
+	if d < 0 {
+		d = 0
+	}
+	p.signalTimer.Reset(d)
 }
 
 // Run 阻塞运行，直到 ctx 取消。
 // 驱动源：订阅信号（优先，事件驱动）+ 兜底 ticker（信号丢失/订阅失效时保底）。
 func (p *Poller) Run(ctx context.Context) {
+	// 信号延迟定时器：到点投递信号通道（非阻塞，busy 时缓冲待下轮）
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.signalTimer.C:
+				p.signalPending.Store(false)
+				select {
+				case p.signalCh <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}()
 	state := bpNormal
 	ticker := time.NewTicker(p.cfg.Interval)
 	defer ticker.Stop()
@@ -121,10 +153,7 @@ func (p *Poller) Run(ctx context.Context) {
 		case <-ticker.C:
 			triggered = true // 兜底轮询：即使无信号也按周期查询（V1.1 行为保留）
 		case <-p.signalCh:
-			// 订阅信号触发：最小间隔护栏，防高频信号打满 Poller
-			if time.Since(p.lastPoll) >= p.cfg.MinSignalInterval {
-				triggered = true
-			}
+			triggered = true // 信号触发（最小间隔已由延迟定时器保证）
 		}
 		if !triggered {
 			continue
@@ -176,7 +205,7 @@ func (p *Poller) Run(ctx context.Context) {
 		}
 
 		blocked := p.pollOnce(ctx)
-		p.lastPoll = time.Now()
+		p.lastPoll.Store(time.Now().UnixNano())
 		// watermark 解锁自唤醒（仅信号模式）：本轮窗口被水位截断时，
 		// 安排 watermark 时长后自动再查一次，避免等待下一个 ticker 的闲置延迟
 		if blocked && !p.wakeupScheduled.Load() {
@@ -255,10 +284,11 @@ func (p *Poller) queryOptions() influx.QueryOptions {
 }
 
 // queryParallel 将 [start,end) 窗口切分为 N 段并行查询，结果按段序归并。
-// 段边界 +1ns 重叠（V1.2.3）：边界点由相邻两段重复查询，归并时按
-// Point.Key()（measurement+tags+timestamp）去重——防御 InfluxDB 高压写入时
-// 并行查询偶发漏行（实测 11:33:01.71884Z 丢 1 点）。重复查询的点由
-// InfluxDB 幂等覆盖保证不产生重复计数。
+// 段边界 +1ns 重叠（V1.2.3）：边界点由相邻两段重复查询，防御 InfluxDB
+// 高压写入时并行查询偶发漏行。
+//
+// 去重只覆盖 N-1 个边界时间戳（P2）：重叠仅发生在边界纳秒上，对每个边界
+// 收集少量点做比较即可——消除全窗口 Key() 构造与全量 map 内存。
 // 并行数<=1 时退化为单次串行查询（行为与 V1.0 一致）。
 func (p *Poller) queryParallel(ctx context.Context, start, end int64) ([]model.Point, error) {
 	n := p.cfg.ParallelQueries
@@ -288,35 +318,94 @@ func (p *Poller) queryParallel(ctx context.Context, start, end int64) ([]model.P
 			results <- qr{idx, pts, err}
 		}(i, s, e)
 	}
-	// 收集全部结果后按段序（idx）归并，保证输出时间升序
+	// 收集全部结果后按段序（idx）归并，保证输出时间升序；
+	// 边界去重直接在归并时完成（只处理边界 ts 的少量点）
 	resps := make([]qr, 0, n)
 	for i := 0; i < n; i++ {
 		resps = append(resps, <-results)
 	}
 	sort.Slice(resps, func(i, j int) bool { return resps[i].idx < resps[j].idx })
 	all := make([]model.Point, 0, (end-start)/1e6)
-	seen := make(map[string]struct{}, (end-start)/1e6)
 	var firstErr error
-	for _, r := range resps {
+	for i, r := range resps {
 		if r.err != nil {
 			if firstErr == nil {
 				firstErr = r.err
 			}
 			continue
 		}
-		for _, pt := range r.points {
-			k := pt.Key()
-			if _, dup := seen[k]; dup {
+		pts := r.points
+		if i > 0 {
+			// 边界去重：前段尾部与当前段头部 ts==boundary 的点可能重复
+			// （若 i-1 段查询失败未贡献点，all 尾部无 boundary 点则不触发）
+			boundary := start + int64(i)*step
+			t := len(all)
+			for t > 0 && all[t-1].Timestamp == boundary {
+				t--
+			}
+			h := 0
+			for h < len(pts) && pts[h].Timestamp == boundary {
+				h++
+			}
+			if t < len(all) && h > 0 {
+				var set boundarySet
+				for j := t; j < len(all); j++ {
+					set.add(all[j])
+				}
+				prevTail := all[t:] // 前段尾部边界点（权威副本，保留）
+				all = all[:t]
+				all = append(all, prevTail...)
+				for j := 0; j < h; j++ {
+					if !set.contains(pts[j]) {
+						all = append(all, pts[j])
+					}
+				}
+				all = append(all, pts[h:]...)
 				continue
 			}
-			seen[k] = struct{}{}
-			all = append(all, pt)
 		}
+		all = append(all, pts...)
 	}
 	if firstErr != nil {
 		return nil, firstErr
 	}
 	return all, nil
+}
+
+// boundarySet 边界时间戳去重集合：小集合零分配线性比较，大集合自动切换 Key 映射。
+type boundarySet struct {
+	small []model.Point
+	big   map[string]struct{}
+}
+
+const boundaryLinearLimit = 8
+
+func (s *boundarySet) add(p model.Point) {
+	if len(s.small) < boundaryLinearLimit {
+		s.small = append(s.small, p)
+		return
+	}
+	if s.big == nil {
+		s.big = make(map[string]struct{}, boundaryLinearLimit*4)
+		for _, q := range s.small {
+			s.big[q.Key()] = struct{}{}
+		}
+		s.small = nil
+	}
+	s.big[p.Key()] = struct{}{}
+}
+
+func (s *boundarySet) contains(p model.Point) bool {
+	for _, q := range s.small {
+		if model.PointsEqual(q, p) {
+			return true
+		}
+	}
+	if s.big != nil {
+		_, ok := s.big[p.Key()]
+		return ok
+	}
+	return false
 }
 
 // effectiveBatchPoints 降速时批次减半（黄色反压）。
@@ -344,6 +433,9 @@ func (p *Poller) appendFrames(points []model.Point) error {
 }
 
 // appendBatch 将 points 按 batch 分帧追加；编码失败且 batch>1 时对失败段减半重试。
+// 组帧用 LinesToProtocolBytes（零行级分配）+ 并行编码；落盘用 AppendBatch
+// group commit（每轮一次 fsync，替代每帧 fsync）。
+// C4：batch=1 且单点仍超限时跳过该点并告警计数（防止游标永久卡死）。
 func (p *Poller) appendBatch(points []model.Point, batch int) error {
 	if len(points) == 0 {
 		return nil
@@ -356,7 +448,6 @@ func (p *Poller) appendBatch(points []model.Point, batch int) error {
 
 	type framed struct {
 		idx  int
-		seq  uint64
 		data []byte
 		err  error
 	}
@@ -379,36 +470,44 @@ func (p *Poller) appendBatch(points []model.Point, batch int) error {
 				if endPt > len(points) {
 					endPt = len(points)
 				}
-				lines, err := model.LinesToProtocol(points[start:endPt])
+				payload, err := model.LinesToProtocolBytes(points[start:endPt])
 				if err != nil {
 					frames <- framed{idx: i, err: err}
 					continue
 				}
-				payload := []byte(strings.Join(lines, "\n"))
 				fb, err := protocol.Encode(protocol.TypeData, baseSeq+uint64(i), payload)
 				if err != nil {
 					frames <- framed{idx: i, err: err}
 					continue
 				}
-				frames <- framed{idx: i, seq: baseSeq + uint64(i), data: fb}
+				frames <- framed{idx: i, data: fb}
 			}
 		}(w)
 	}
 	go func() { wg.Wait(); close(frames) }()
 
-	// 按 idx 顺序落 WAL（顺序铁律：seq 必须与 NextSeq 严格递增一致）
+	// 按 idx 顺序收集
 	got := make([]*framed, nFrames)
 	for f := range frames {
 		ff := f
 		got[f.idx] = &ff
 	}
+	// 顺序处理（顺序铁律：seq 必须与 NextSeq 严格递增一致）
+	var good [][]byte
 	for i := 0; i < nFrames; i++ {
 		f := got[i]
 		if f == nil {
 			return fmt.Errorf("frame %d missing", i)
 		}
 		if f.err != nil {
-			if batch > 1 && isFrameTooLarge(f.err) {
+			if isFrameTooLarge(f.err) && batch > 1 {
+				// 先落盘 i 之前的帧，再递归拆批失败段
+				if len(good) > 0 {
+					if err := p.appendGood(baseSeq, good); err != nil {
+						return err
+					}
+					good = nil
+				}
 				start := i * batch
 				endPt := start + batch
 				if endPt > len(points) {
@@ -416,16 +515,37 @@ func (p *Poller) appendBatch(points []model.Point, batch int) error {
 				}
 				p.logger.Warn("frame too large, splitting batch",
 					zap.Int("batch", batch), zap.Int("points", endPt-start))
-				// 注意：i 之前的帧已落盘，递归只重试失败段（seq 从 NextSeq 继续）
-				return p.appendBatch(points[start:endPt], batch/2)
+				if err := p.appendBatch(points[start:endPt], batch/2); err != nil {
+					return err
+				}
+				// 递归返回后继续处理后续帧（seq 从 NextSeq 续）
+				baseSeq = p.wal.NextSeq()
+				continue
+			}
+			if isFrameTooLarge(f.err) {
+				// batch==1 且单点超 16MB/1MB 上限：跳过该点并告警计数，游标继续推进
+				p.metrics.IncSkipPoint()
+				p.logger.Error("point too large, skipped (would deadlock cursor)",
+					zap.Int64("ts", points[i].Timestamp), zap.Error(f.err))
+				continue
 			}
 			return f.err
 		}
-		if err := p.wal.AppendEncoded(protocol.TypeData, f.seq, f.data); err != nil {
-			return err
-		}
+		good = append(good, f.data)
+	}
+	if len(good) > 0 {
+		return p.appendGood(baseSeq, good)
 	}
 	return nil
+}
+
+// appendGood 落盘连续帧段（group commit）：按 NextSeq 重写头部 seq 后一次 fsync。
+func (p *Poller) appendGood(baseSeq uint64, good [][]byte) error {
+	for j := range good {
+		// 编码阶段 seq 为 baseSeq+idx；跳帧后可能错位，按落盘序重写
+		binary.BigEndian.PutUint64(good[j][4:12], baseSeq+uint64(j))
+	}
+	return p.wal.AppendBatch(protocol.TypeData, baseSeq, good)
 }
 
 // isFrameTooLarge 判断编码失败是否因帧超限（可拆批恢复）。

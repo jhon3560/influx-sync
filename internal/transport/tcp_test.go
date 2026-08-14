@@ -170,3 +170,53 @@ func TestHeartbeatRoundTrip(t *testing.T) {
 		t.Fatal("heartbeat not received")
 	}
 }
+
+// TestServerOrderedAckUnderConcurrency A2：handler 并发执行（帧 2 快于帧 1），
+// ACK 仍必须按帧到达顺序写回（0xff/0x00 顺序与停等模式 wire 兼容）。
+func TestServerOrderedAckUnderConcurrency(t *testing.T) {
+	release := make(chan struct{})
+	srv := NewServer(ServerConfig{Listen: "127.0.0.1:0", MaxInflight: 8}, func(id uint64, fb []byte) byte {
+		f, err := protocol.Decode(fb)
+		if err != nil {
+			return protocol.AckFail
+		}
+		if f.Seq == 1 {
+			<-release // 帧 1 慢
+		}
+		return protocol.AckSuccess
+	})
+	if err := srv.Listen(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go srv.Serve(ctx)
+	t.Cleanup(func() { cancel(); srv.Close() })
+
+	c := NewClient(ClientConfig{Addr: srv.Addr().String(), Timeout: 3 * time.Second})
+	defer c.Close()
+	if err := c.EnsureConnected(); err != nil {
+		t.Fatal(err)
+	}
+	fb1, _ := protocol.EncodeData(1, []byte("m value=1 1"))
+	fb2, _ := protocol.EncodeData(2, []byte("m value=2 2"))
+	// 连发两帧（滑窗模拟）
+	c.SendFrame(fb1)
+	c.SendFrame(fb2)
+	// 帧 1 阻塞：确认帧 2 已完成处理，但 ACK 一个都不能先到（顺序写回）
+	time.Sleep(100 * time.Millisecond)
+	c.conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	var b [1]byte
+	if n, _ := c.conn.Read(b[:]); n > 0 {
+		t.Fatalf("ACK must be in order: got byte %x before frame 1 completed", b[0])
+	}
+	// 放行帧 1：ACK 顺序为 0xff, 0xff
+	close(release)
+	a1, err := c.WaitAck()
+	if err != nil || a1 != protocol.AckSuccess {
+		t.Fatalf("ack1=%x err=%v", a1, err)
+	}
+	a2, err := c.WaitAck()
+	if err != nil || a2 != protocol.AckSuccess {
+		t.Fatalf("ack2=%x err=%v", a2, err)
+	}
+}

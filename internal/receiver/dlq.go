@@ -3,11 +3,14 @@ package receiver
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"influx-sync/internal/influx"
 )
 
 // DLQMeta 死信报文 JSON 规范（依据《死信隔离与反压机制逻辑》）。
@@ -59,9 +62,22 @@ func writeDLQJSON(dir string, meta DLQMeta, gzipPayload []byte) (string, error) 
 // classifyWriteError 错误分类器：区分可重试（Transient）与永久（Permanent）错误。
 // 永久错误（HTTP 400/413 等客户端错误、解析类错误）→ 毒丸，直接进 DLQ。
 // 其余（500/503/超时/网络）→ 可重试，回 0x00。
+// 优先使用 influx 包的 typed error（*WriteHTTPError，C3：不依赖错误文案）；
+// 字符串解析仅作为非本客户端错误的兼容路径。
 func classifyWriteError(err error) (permanent bool, httpStatus int, category string) {
+	var he *influx.WriteHTTPError
+	if errors.As(err, &he) {
+		switch {
+		case he.StatusCode >= 400 && he.StatusCode < 500:
+			return true, he.StatusCode, "PERMANENT_ERROR"
+		case he.StatusCode >= 500:
+			return false, he.StatusCode, "TRANSIENT_ERROR"
+		default:
+			return false, he.StatusCode, "TRANSIENT_ERROR"
+		}
+	}
 	msg := err.Error()
-	// influx 客户端错误消息格式: "influx: write http 400: ..."
+	// 兼容旧错误文案格式: "influx: write http 400: ..."
 	if idx := strings.Index(msg, "write http "); idx >= 0 {
 		rest := msg[idx+len("write http "):]
 		var code int

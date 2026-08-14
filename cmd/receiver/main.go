@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -66,17 +67,28 @@ func run() error {
 			return fmt.Errorf("relay wal open %s: %w", cfg.Relay.WALDir, err)
 		}
 		cfg.RelayWAL = relayWAL
+		// C2：转发失败转存目录（默认 <wal_dir>/../relay_dlq）
+		if cfg.Relay.DLQDir == "" {
+			cfg.Relay.DLQDir = filepath.Join(filepath.Dir(cfg.Relay.WALDir), "relay_dlq")
+		}
+		// C5：relay.timeout 配置项真正生效（原先硬编码 10s）
+		relayTimeout := cfg.RelayTimeout()
 		relayClient := transport.NewClient(transport.ClientConfig{
 			Addr:        cfg.Relay.Addr,
-			Timeout:     time.Second * 10,
-			DialTimeout: 10 * time.Second,
+			Timeout:     relayTimeout,
+			DialTimeout: relayTimeout,
 		})
 		relaySenderLoop = sender.NewSender(relayWAL, relayClient, metrics, log, sender.SenderConfig{})
-		log.Info("relay enabled", zap.String("addr", cfg.Relay.Addr), zap.String("wal", cfg.Relay.WALDir))
+		log.Info("relay enabled", zap.String("addr", cfg.Relay.Addr),
+			zap.String("wal", cfg.Relay.WALDir),
+			zap.String("dlq", cfg.Relay.DLQDir),
+			zap.Duration("timeout", relayTimeout))
 	}
 
-	// 帧处理器（校验/去重/写库/ACK）
-	handler, err := receiver.New(influxClient, metrics, log, cfg.ReceiverConfig())
+	// 帧处理器（校验/去重/写库/ACK）；A5：落库点时间戳 → e2e 延迟指标
+	rcfg := cfg.ReceiverConfig()
+	rcfg.LastWriteTs = metrics.SetLastWriteTs
+	handler, err := receiver.New(influxClient, metrics, log, rcfg)
 	if err != nil {
 		return err
 	}

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -176,5 +177,56 @@ func TestParseSize(t *testing.T) {
 		if err != nil || got != c.want {
 			t.Fatalf("parseSize(%q)=%d,%v want %d", c.in, got, err, c.want)
 		}
+	}
+}
+
+// TestValidateRejectsBadDurations 小项加固：dur 解析失败/负值必须报错，不再静默回退。
+func TestValidateRejectsBadDurations(t *testing.T) {
+	sc := &SenderConfig{}
+	sc.Source.URL = "http://x"
+	sc.Source.Database = "d"
+	sc.TCP.Addr = "1.1.1.1:1"
+	sc.WAL.Path = "/tmp/w"
+	sc.Sync.Interval = "bogus"
+	if err := sc.Validate(); err == nil || !strings.Contains(err.Error(), "sync.interval") {
+		t.Fatalf("bogus interval must be rejected, got %v", err)
+	}
+	sc.Sync.Interval = "-5s"
+	if err := sc.Validate(); err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("negative interval must be rejected, got %v", err)
+	}
+	sc.Sync.Interval = ""
+	if err := sc.Validate(); err != nil {
+		t.Fatalf("empty duration (use default) must pass: %v", err)
+	}
+
+	rc := &ReceiverConfig{}
+	rc.Target.URL = "http://x"
+	rc.Target.Database = "d"
+	rc.TCP.Listen = ":1"
+	rc.Relay.Timeout = "nonsense"
+	if err := rc.Validate(); err == nil || !strings.Contains(err.Error(), "relay.timeout") {
+		t.Fatalf("bad relay.timeout must be rejected, got %v", err)
+	}
+	rc.Relay.Timeout = "3s"
+	if err := rc.Validate(); err != nil {
+		t.Fatalf("valid relay.timeout must pass: %v", err)
+	}
+	// C5：RelayTimeout 转换真实生效
+	if got := rc.RelayTimeout(); got != 3*time.Second {
+		t.Fatalf("RelayTimeout=%v, want 3s", got)
+	}
+}
+
+// TestMinSignalIntervalWired 小项修复：signal_min_interval 从 YAML 传入 PollerConfig。
+func TestMinSignalIntervalWired(t *testing.T) {
+	sc := &SenderConfig{}
+	sc.Sync.SignalMinInterval = "50ms"
+	pc := sc.PollerConfig()
+	if pc.MinSignalInterval != 50*time.Millisecond {
+		t.Fatalf("MinSignalInterval=%v, want 50ms", pc.MinSignalInterval)
+	}
+	if got := (&SenderConfig{}).PollerConfig().MinSignalInterval; got != 200*time.Millisecond {
+		t.Fatalf("default MinSignalInterval=%v, want 200ms", got)
 	}
 }

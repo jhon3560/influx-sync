@@ -1,6 +1,6 @@
 # influx-sync
 
-InfluxDB 跨正向隔离同步系统（ISFP 协议，V1.3.1）。
+InfluxDB 跨正向隔离同步系统（ISFP 协议，V1.4.0）。
 
 **功能**：安全区 I 的 InfluxDB 1.x 数据 → 正向隔离装置（TCP 映射）→ 安全区 III 的 InfluxDB 1.x，
 单向、有序、At-Least-Once、断点续传同步。实测 **20 万点/s 实时零丢失**（64 核/124G，麒麟 V10）。
@@ -28,6 +28,7 @@ InfluxDB 跨正向隔离同步系统（ISFP 协议，V1.3.1）。
 | v1.2.3 | 并行查询段边界 +1ns 重叠 + 归并去重（高压漏行防御） |
 | v1.3 | Receiver 中继：落盘同时转发下一跳 |
 | v1.3.1 | 代码审计修复：DLQ 偏移/seq 跳跃死锁/拆批卡死 + NaN/转义/精度等 13 项 |
+| v1.4.0 | 性能审计修复：组帧重构（60x CPU）+ 边界去重 + checkpoint 节流 + group commit + WriteRaw + 传输调优 + single-flight schema + Receiver 流水线按序 ACK + 滑窗（实验项） + P0 修复（撕裂尾恢复/中继 DLQ/LRU 吞重试）+ e2e 延迟指标 |
 
 ## 目录
 
@@ -67,5 +68,5 @@ go test -race ./internal/...
 | [docs/deployment.md](docs/deployment.md) | 部署：安装/systemd/双实例/防火墙/升级 |
 | [docs/operations.md](docs/operations.md) | 运维：日志/指标/排障/备份/已知问题 |
 | [docs/relay.md](docs/relay.md) | 中继功能（V1.3） |
-| [docs/audit-fixes-2026-08.md](docs/audit-fixes-2026-08.md) | 代码审计修复记录（V1.3.1） |
+| [docs/audit-fixes-2026-08.md](docs/audit-fixes-2026-08.md) | 代码审计修复记录（V1.3.1 → V1.4.0） |
 | [docs/AGENT.md](docs/AGENT.md) | 开发环境与上下文（设备/部署拓扑/决策/约束） |

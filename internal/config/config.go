@@ -45,17 +45,18 @@ func (c *MonitorConfig) Auth() *monitor.Auth {
 type SenderConfig struct {
 	Source influx.Config `yaml:"source"`
 	Sync   struct {
-		Interval        string   `yaml:"interval"`        // 轮询周期
-		Window          string   `yaml:"window"`          // 查询窗口
-		Watermark       string   `yaml:"watermark"`       // 水位延迟
-		MaxWindow       string   `yaml:"max_window"`      // 窗口上限（防时间跳变）
-		BatchPoints     int      `yaml:"batch_points"`    // 单帧点数
-		QueryLimit      int      `yaml:"query_limit"`     // 单次查询 LIMIT（分页粒度）
-		ParallelQueries int      `yaml:"poller_parallel"` // 多窗口并行查询数（0=串行，默认4）
-		SignalListen    string   `yaml:"signal_listen"`   // 订阅信号监听地址（如 ":18098"）；空=纯轮询
-		Backfill        string   `yaml:"backfill"`        // 首次启动回填：游标初始化为 now-watermark-backfill
-		TagColumns      []string `yaml:"tag_columns"`     // 显式 tag 列（空=自动 SHOW TAG KEYS 发现）
-		Measurements    []string `yaml:"measurements"`    // 同步的 measurement 列表
+		Interval          string   `yaml:"interval"`            // 轮询周期
+		Window            string   `yaml:"window"`              // 查询窗口
+		Watermark         string   `yaml:"watermark"`           // 水位延迟
+		MaxWindow         string   `yaml:"max_window"`          // 窗口上限（防时间跳变）
+		BatchPoints       int      `yaml:"batch_points"`        // 单帧点数
+		QueryLimit        int      `yaml:"query_limit"`         // 单次查询 LIMIT（分页粒度）
+		ParallelQueries   int      `yaml:"poller_parallel"`     // 多窗口并行查询数（0=串行，默认4）
+		SignalListen      string   `yaml:"signal_listen"`       // 订阅信号监听地址（如 ":18098"）；空=纯轮询
+		SignalMinInterval string   `yaml:"signal_min_interval"` // 订阅信号最小查询间隔（默认 200ms）
+		Backfill          string   `yaml:"backfill"`            // 首次启动回填：游标初始化为 now-watermark-backfill
+		TagColumns        []string `yaml:"tag_columns"`         // 显式 tag 列（空=自动 SHOW TAG KEYS 发现）
+		Measurements      []string `yaml:"measurements"`        // 同步的 measurement 列表
 	} `yaml:"sync"`
 	WAL struct {
 		Path        string `yaml:"path"`
@@ -71,6 +72,7 @@ type SenderConfig struct {
 		BackoffBase       string `yaml:"backoff_base"`
 		BackoffMax        string `yaml:"backoff_max"`
 		HeartbeatInterval string `yaml:"heartbeat_interval"`
+		Pipeline          int    `yaml:"pipeline_window"` // A1 滑窗（实验项）：默认 1=停等；>1 需确认装置支持
 	} `yaml:"sender"`
 	Monitor MonitorConfig `yaml:"monitor"`
 	Log     LogConfig     `yaml:"log"`
@@ -82,6 +84,8 @@ type ReceiverConfig struct {
 	TCP    struct {
 		Listen      string `yaml:"listen"`
 		ReadTimeout string `yaml:"read_timeout"`
+		MaxInflight int    `yaml:"max_inflight"` // A2 并发写库流水线窗口（默认 8）
+		MaxConns    int    `yaml:"max_conns"`    // 最大并发连接（0=不限制）
 	} `yaml:"tcp"`
 	Dedup struct {
 		Cap         int    `yaml:"cap"`
@@ -94,6 +98,7 @@ type ReceiverConfig struct {
 		Addr    string `yaml:"addr"`    // 中继目标地址（如 "198.51.100.x:28103"）；空=不启用中继
 		WALDir  string `yaml:"wal_dir"` // 转发 WAL 目录（重启不丢，必须配置）
 		Timeout string `yaml:"timeout"` // 转发读写超时
+		DLQDir  string `yaml:"dlq_dir"` // 转发失败转存目录（C2）；空=默认 <wal_dir>/../relay_dlq
 	} `yaml:"relay"`
 	RelayWAL *wal.WAL      `yaml:"-"` // 转发 WAL 句柄（程序内注入，非配置文件）
 	Monitor  MonitorConfig `yaml:"monitor"`
@@ -178,7 +183,7 @@ func applyReceiverEnv(c *ReceiverConfig) {
 	}
 }
 
-// Validate 校验必填项。
+// Validate 校验必填项与取值范围（dur 解析失败/负值不再静默回退默认值）。
 func (c *SenderConfig) Validate() error {
 	if c.Source.URL == "" || c.Source.Database == "" {
 		return fmt.Errorf("config: source.url and source.database required")
@@ -189,16 +194,65 @@ func (c *SenderConfig) Validate() error {
 	if c.WAL.Path == "" {
 		return fmt.Errorf("config: wal.path required")
 	}
+	for name, s := range map[string]string{
+		"sync.interval":             c.Sync.Interval,
+		"sync.window":               c.Sync.Window,
+		"sync.watermark":            c.Sync.Watermark,
+		"sync.max_window":           c.Sync.MaxWindow,
+		"sync.signal_min_interval":  c.Sync.SignalMinInterval,
+		"sync.backfill":             c.Sync.Backfill,
+		"tcp.timeout":               c.TCP.Timeout,
+		"tcp.dial_timeout":          c.TCP.DialTimeout,
+		"sender.backoff_base":       c.Sender.BackoffBase,
+		"sender.backoff_max":        c.Sender.BackoffMax,
+		"sender.heartbeat_interval": c.Sender.HeartbeatInterval,
+	} {
+		if err := validateDur(name, s); err != nil {
+			return err
+		}
+	}
+	if c.Sender.Pipeline < 0 {
+		return fmt.Errorf("config: sender.pipeline_window must be >= 0")
+	}
 	return nil
 }
 
-// Validate 校验必填项。
+// validateDur 校验时长配置：空合法（用默认值），非空必须可解析且非负。
+func validateDur(name, s string) error {
+	if s == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return fmt.Errorf("config: %s: bad duration %q: %w", name, s, err)
+	}
+	if d < 0 {
+		return fmt.Errorf("config: %s: negative duration %q not allowed", name, s)
+	}
+	return nil
+}
+
+// Validate 校验必填项与取值范围。
 func (c *ReceiverConfig) Validate() error {
 	if c.Target.URL == "" || c.Target.Database == "" {
 		return fmt.Errorf("config: target.url and target.database required")
 	}
 	if c.TCP.Listen == "" {
 		return fmt.Errorf("config: tcp.listen required")
+	}
+	if c.TCP.MaxInflight < 0 {
+		return fmt.Errorf("config: tcp.max_inflight must be >= 0")
+	}
+	if c.TCP.MaxConns < 0 {
+		return fmt.Errorf("config: tcp.max_conns must be >= 0")
+	}
+	for name, s := range map[string]string{
+		"tcp.read_timeout": c.TCP.ReadTimeout,
+		"relay.timeout":    c.Relay.Timeout,
+	} {
+		if err := validateDur(name, s); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -219,15 +273,16 @@ func dur(s string, def time.Duration) time.Duration {
 // PollerConfig 转换。
 func (c *SenderConfig) PollerConfig() sender.PollerConfig {
 	return sender.PollerConfig{
-		Interval:        dur(c.Sync.Interval, time.Second),
-		Window:          dur(c.Sync.Window, 5*time.Second),
-		Watermark:       dur(c.Sync.Watermark, 10*time.Second),
-		MaxWindow:       dur(c.Sync.MaxWindow, 30*time.Second),
-		BatchPoints:     c.Sync.BatchPoints,
-		QueryLimit:      c.Sync.QueryLimit,
-		ParallelQueries: c.Sync.ParallelQueries,
-		TagColumns:      c.Sync.TagColumns,
-		Measurements:    c.Sync.Measurements,
+		Interval:          dur(c.Sync.Interval, time.Second),
+		Window:            dur(c.Sync.Window, 5*time.Second),
+		Watermark:         dur(c.Sync.Watermark, 10*time.Second),
+		MaxWindow:         dur(c.Sync.MaxWindow, 30*time.Second),
+		BatchPoints:       c.Sync.BatchPoints,
+		QueryLimit:        c.Sync.QueryLimit,
+		ParallelQueries:   c.Sync.ParallelQueries,
+		MinSignalInterval: dur(c.Sync.SignalMinInterval, 200*time.Millisecond),
+		TagColumns:        c.Sync.TagColumns,
+		Measurements:      c.Sync.Measurements,
 	}
 }
 
@@ -248,6 +303,7 @@ func (c *SenderConfig) SenderLoopConfig() sender.SenderConfig {
 		BackoffBase:       dur(c.Sender.BackoffBase, time.Second),
 		BackoffMax:        dur(c.Sender.BackoffMax, 60*time.Second),
 		HeartbeatInterval: dur(c.Sender.HeartbeatInterval, 30*time.Second),
+		Pipeline:          c.Sender.Pipeline,
 	}
 }
 
@@ -306,6 +362,8 @@ func (c *ReceiverConfig) ServerConfig() transport.ServerConfig {
 	return transport.ServerConfig{
 		Listen:      c.TCP.Listen,
 		ReadTimeout: dur(c.TCP.ReadTimeout, 60*time.Second),
+		MaxInflight: c.TCP.MaxInflight,
+		MaxConns:    c.TCP.MaxConns,
 	}
 }
 
@@ -316,5 +374,12 @@ func (c *ReceiverConfig) ReceiverConfig() receiver.Config {
 		DedupCap:    c.Dedup.Cap,
 		DLQDir:      c.DLQ.Dir,
 		RelayWAL:    c.RelayWAL, // 由 main 注入（需要 wal 包），nil=不启用中继
+		RelayDLQDir: c.Relay.DLQDir,
+		OrderedSeq:  c.TCP.MaxInflight > 1, // A2 流水线下 last_seq 按序推进
 	}
+}
+
+// RelayTimeout 返回中继转发超时（C5：配置文件解析后真正生效）。
+func (c *ReceiverConfig) RelayTimeout() time.Duration {
+	return dur(c.Relay.Timeout, 10*time.Second)
 }

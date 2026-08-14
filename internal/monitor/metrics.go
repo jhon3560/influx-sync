@@ -30,6 +30,10 @@ type Metrics struct {
 	bpStatus     atomic.Int64  // influx_sync_backpressure_status 0/1/2
 	pausedSecs   atomic.Int64  // influx_sync_poller_paused_seconds_total
 	poisonPacket atomic.Uint64 // influx_sync_poison_packet_count
+	// V1.4 新增
+	skipPoint   atomic.Uint64 // point_skip_total：超限跳过的单点（防游标卡死）
+	lastWriteTs atomic.Int64  // receiver 最后落库点时间戳（ns，0=未知）
+	relayDLQ    atomic.Uint64 // relay_dlq_total：中继 WAL 失败转存计数
 }
 
 // New 创建指标集合。
@@ -52,6 +56,9 @@ func (m *Metrics) IncWriteOk()           { m.writeOk.Add(1) }
 func (m *Metrics) IncRecv()              { m.recvTotal.Add(1) }
 func (m *Metrics) IncDup()               { m.dupTotal.Add(1) }
 
+// AckFailCount 返回 ACK 失败计数（测试用）。
+func (m *Metrics) AckFailCount() uint64 { return m.ackFail.Load() }
+
 // --- 文档指标（《死信隔离与反压机制逻辑》）---
 
 // SetWALDiskRatio 设置 WAL 挂载盘占用率（0~1，×10000 存储避免浮点原子）。
@@ -65,6 +72,31 @@ func (m *Metrics) AddPausedSeconds(v int64) { m.pausedSecs.Add(v) }
 
 // IncPoisonPacket 累加毒丸报文计数。
 func (m *Metrics) IncPoisonPacket() { m.poisonPacket.Add(1) }
+
+// IncSkipPoint 累加超限跳过的单点计数（batch=1 仍超 16MB/1MB 的病理点）。
+func (m *Metrics) IncSkipPoint() { m.skipPoint.Add(1) }
+
+// SkipPointCount 返回跳点计数（测试用）。
+func (m *Metrics) SkipPointCount() uint64 { return m.skipPoint.Load() }
+
+// SetLastWriteTs 记录 receiver 最后落库点时间戳（只增不减）。
+func (m *Metrics) SetLastWriteTs(ts int64) {
+	for {
+		cur := m.lastWriteTs.Load()
+		if ts <= cur || m.lastWriteTs.CompareAndSwap(cur, ts) {
+			return
+		}
+	}
+}
+
+// LastWriteTs 返回最后落库点时间戳（测试用）。
+func (m *Metrics) LastWriteTs() int64 { return m.lastWriteTs.Load() }
+
+// IncRelayDLQ 累加中继转发失败转存计数。
+func (m *Metrics) IncRelayDLQ() { m.relayDLQ.Add(1) }
+
+// RelayDLQCount 返回中继转存计数（测试用）。
+func (m *Metrics) RelayDLQCount() uint64 { return m.relayDLQ.Load() }
 
 // DLQCount 返回死信计数（测试用）。
 func (m *Metrics) DLQCount() uint64 { return m.dlqTotal.Load() }
@@ -127,12 +159,22 @@ write_fail %d
 # HELP dup_total Receiver 去重命中总数
 # TYPE dup_total counter
 dup_total %d
+# HELP point_skip_total 超限跳过单点总数（batch=1 仍超上限的病理点）
+# TYPE point_skip_total counter
+point_skip_total %d
+# HELP relay_dlq_total 中继转发失败转存总数
+# TYPE relay_dlq_total counter
+relay_dlq_total %d
+# HELP sync_e2e_delay_seconds 端到端延迟（now - 目标库最后写入点时间，0=未知）
+# TYPE sync_e2e_delay_seconds gauge
+sync_e2e_delay_seconds %d
 `,
 		m.cursor.Load(), syncDelay,
 		m.walPending.Load(), m.walBytes.Load(),
 		m.sendTotal.Load(), m.ackOk.Load(), m.ackFail.Load(),
 		m.retry.Load(), m.dlqTotal.Load(), m.heartbeat.Load(), m.pollSkip.Load(),
-		m.recvTotal.Load(), m.writeOk.Load(), m.writeFail.Load(), m.dupTotal.Load())
+		m.recvTotal.Load(), m.writeOk.Load(), m.writeFail.Load(), m.dupTotal.Load(),
+		m.skipPoint.Load(), m.relayDLQ.Load(), m.e2eDelay())
 	// 文档指标（《死信隔离与反压机制逻辑》）
 	out += fmt.Sprintf(`# HELP influx_sync_wal_disk_usage_ratio WAL 挂载盘占用率
 # TYPE influx_sync_wal_disk_usage_ratio gauge
@@ -156,6 +198,19 @@ influx_sync_poison_packet_count %d
 // nowUnixNano 可被测试替换。
 var nowUnixNano = func() int64 { return time.Now().UnixNano() }
 
+// e2eDelay 端到端延迟秒数（now - 最后落库点时间）。0=未知（尚无写入）。
+func (m *Metrics) e2eDelay() int64 {
+	ts := m.lastWriteTs.Load()
+	if ts == 0 {
+		return 0
+	}
+	d := (nowUnixNano() - ts) / 1e9
+	if d < 0 {
+		d = 0
+	}
+	return d
+}
+
 // Auth 监控端口认证配置（nil/空用户名=不启用认证）。
 type Auth struct {
 	Username string
@@ -172,10 +227,16 @@ func (m *Metrics) Handler() http.Handler {
 
 // NewHTTPServer 创建指标 HTTP 服务（由调用方启动/关闭）。
 // auth 为 nil 或用户名为空时不启用认证（兼容旧部署）。
+// 加 ReadTimeout/ReadHeaderTimeout：防止慢连接占住指标端口（小项加固）。
 func (m *Metrics) NewHTTPServer(addr string, auth *Auth) *http.Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", m.authMiddleware(auth, m.Handler()))
-	return &http.Server{Addr: addr, Handler: mux}
+	return &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadTimeout:       15 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 }
 
 // authMiddleware 实现 HTTP Basic Auth；密码比较使用常量时间算法（防定时攻击）。
