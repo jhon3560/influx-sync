@@ -13,7 +13,7 @@ import (
 func startEchoServer(t *testing.T, fail bool) (addr string, gotSeq chan uint64) {
 	t.Helper()
 	gotSeq = make(chan uint64, 64)
-	srv := NewServer(ServerConfig{Listen: "127.0.0.1:0"}, func(id uint64, frameBytes []byte) byte {
+	srv := NewServer(ServerConfig{Listen: "127.0.0.1:0"}, func(id uint64, _ uint64, frameBytes []byte) byte {
 		f, err := protocol.Decode(frameBytes)
 		if err != nil {
 			return protocol.AckFail
@@ -175,7 +175,7 @@ func TestHeartbeatRoundTrip(t *testing.T) {
 // ACK 仍必须按帧到达顺序写回（0xff/0x00 顺序与停等模式 wire 兼容）。
 func TestServerOrderedAckUnderConcurrency(t *testing.T) {
 	release := make(chan struct{})
-	srv := NewServer(ServerConfig{Listen: "127.0.0.1:0", MaxInflight: 8}, func(id uint64, fb []byte) byte {
+	srv := NewServer(ServerConfig{Listen: "127.0.0.1:0", MaxInflight: 8}, func(id uint64, _ uint64, fb []byte) byte {
 		f, err := protocol.Decode(fb)
 		if err != nil {
 			return protocol.AckFail

@@ -7,8 +7,8 @@
 | 项 | 值 |
 |---|---|
 | 源码 | WSL `~/influx-sync-src`（git 管理） |
-| 当前版本 | V1.4.1（tag v1.4.1，分支 feature/audit-fixes） |
-| 版本体系 | v1.0(master) → v1.1(feature/parallel) → v1.2~v1.2.3(feature/signal-trigger) → v1.3+中继 → v1.3.1(审计修复) → v1.4.0(性能审计修复) → v1.4.1(滑窗缺陷复审 N1-N5)；每版本打 tag，二进制保留 .bak |
+| 当前版本 | V1.4.2（tag v1.4.2，分支 feature/audit-fixes） |
+| 版本体系 | v1.0(master) → v1.1(feature/parallel) → v1.2~v1.2.3(feature/signal-trigger) → v1.3+中继 → v1.3.1(审计修复) → v1.4.0(性能审计修复) → v1.4.1(滑窗缺陷复审 N1-N5) → v1.4.2(复审 N6-N8)；每版本打 tag，二进制保留 .bak |
 | 构建 | `CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/sender ./cmd/sender`（麒麟 V10 glibc 2.28 必须静态） |
 | 测试 | `go test ./...`；`go test -race ./internal/...`；交付前两者都过 |
 | 压测工具 | bench/loadgen：`-hx` 格式(hisdb 表) 与 telemetry 格式；`-rate/-duration/-workers/-batch/-url/-db/-user/-pass` |

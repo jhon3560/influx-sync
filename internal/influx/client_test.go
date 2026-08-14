@@ -455,3 +455,63 @@ func TestSchemaRecoversAfterMetaHeals(t *testing.T) {
 		t.Fatalf("status must keep integer semantics after recovery: %v (%T)", pts2[0].Fields["status"], pts2[0].Fields["status"])
 	}
 }
+
+// TestSchemaReuseLastGoodOnMetaFailure N8：元查询失败但有历史成功 schema 时，
+// 降级期复用旧 schema（类型保持正确），而不是类型推断把 tag 列写成 string field
+// （那会在发现恢复后引发 field type conflict 毒丸）。
+func TestSchemaReuseLastGoodOnMetaFailure(t *testing.T) {
+	var metaOK atomic.Bool
+	metaOK.Store(true)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("q")
+		if strings.HasPrefix(q, "SHOW TAG KEYS") {
+			if !metaOK.Load() {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"m","columns":["tagKey"],"values":[["plant"]]}]}]}`)
+			return
+		}
+		if strings.HasPrefix(q, "SHOW FIELD KEYS") {
+			if !metaOK.Load() {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"m","columns":["fieldKey","fieldType"],"values":[["status","integer"]]}]}]}`)
+			return
+		}
+		fmt.Fprint(w, `{"results":[{"series":[{"name":"m","columns":["time","plant","status"],"values":[[1,"A01",7]]}]}]}`)
+	}))
+	defer srv.Close()
+	c := newTestClient(t, srv)
+	// 第一次：发现成功，schema 正确
+	pts, err := c.QueryRange(context.Background(), 0, 10, QueryOptions{})
+	if err != nil || len(pts) != 1 {
+		t.Fatalf("first query: %v", err)
+	}
+	if pts[0].Tags["plant"] != "A01" {
+		t.Fatalf("plant tag missing: %+v", pts[0].Tags)
+	}
+	// 模拟缓存过期 + 元查询持续失败：必须复用旧 schema，类型不得漂移
+	metaOK.Store(false)
+	c.schemaMu.Lock()
+	c.schemaCache["m"].fetchedAt = time.Now().Add(-schemaCacheTTL - time.Second)
+	c.schemaMu.Unlock()
+	pts2, err := c.QueryRange(context.Background(), 0, 10, QueryOptions{})
+	if err != nil {
+		t.Fatalf("second query (meta down): %v", err)
+	}
+	if len(pts2) != 1 || pts2[0].Tags["plant"] != "A01" {
+		t.Fatalf("plant must remain tag via reused schema: %+v", pts2[0].Tags)
+	}
+	if v, ok := pts2[0].Fields["status"].(int64); !ok || v != 7 {
+		t.Fatalf("status must keep integer semantics via reused schema: %v (%T)", pts2[0].Fields["status"], pts2[0].Fields["status"])
+	}
+	// 降级条目：degraded 短 TTL，30s 后重试发现
+	c.schemaMu.Lock()
+	e := c.schemaCache["m"]
+	c.schemaMu.Unlock()
+	if e == nil || !e.degraded {
+		t.Fatalf("expected degraded entry, got %+v", e)
+	}
+}

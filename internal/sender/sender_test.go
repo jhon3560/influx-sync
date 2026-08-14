@@ -188,7 +188,7 @@ func ackServer(t *testing.T, mode string, nackTimes int32) (addr string, receive
 	received = &atomic.Int64{}
 	var nacked atomic.Int32
 	srv := &transport.Server{}
-	srv = transport.NewServer(transport.ServerConfig{Listen: "127.0.0.1:0"}, func(id uint64, fb []byte) byte {
+	srv = transport.NewServer(transport.ServerConfig{Listen: "127.0.0.1:0"}, func(id uint64, _ uint64, fb []byte) byte {
 		received.Add(1)
 		if mode == "always-fail" {
 			return protocol.AckFail
@@ -391,7 +391,7 @@ func TestAppendBatchSplitsOnTooLarge(t *testing.T) {
 // TestSenderPipeline A1：滑窗（Pipeline>1）下多帧在途、按序 ACK、全部提交。
 func TestSenderPipeline(t *testing.T) {
 	var received atomic.Int64
-	srv := transport.NewServer(transport.ServerConfig{Listen: "127.0.0.1:0", MaxInflight: 8}, func(id uint64, fb []byte) byte {
+	srv := transport.NewServer(transport.ServerConfig{Listen: "127.0.0.1:0", MaxInflight: 8}, func(id uint64, _ uint64, fb []byte) byte {
 		received.Add(1)
 		return protocol.AckSuccess
 	})
@@ -434,7 +434,7 @@ func TestSenderPipeline(t *testing.T) {
 func TestSenderPipelineGoBackN(t *testing.T) {
 	var received atomic.Int64
 	var nacked atomic.Int64
-	srv := transport.NewServer(transport.ServerConfig{Listen: "127.0.0.1:0", MaxInflight: 8}, func(id uint64, fb []byte) byte {
+	srv := transport.NewServer(transport.ServerConfig{Listen: "127.0.0.1:0", MaxInflight: 8}, func(id uint64, _ uint64, fb []byte) byte {
 		received.Add(1)
 		f, err := protocol.Decode(fb)
 		if err != nil {
@@ -550,7 +550,7 @@ func TestQueryParallelBoundaryDedup(t *testing.T) {
 func TestSenderPipelineNackFrameNeverCommitted(t *testing.T) {
 	var seq1Nack atomic.Int64
 	var seq1OK atomic.Int64
-	srv := transport.NewServer(transport.ServerConfig{Listen: "127.0.0.1:0", MaxInflight: 8}, func(id uint64, fb []byte) byte {
+	srv := transport.NewServer(transport.ServerConfig{Listen: "127.0.0.1:0", MaxInflight: 8}, func(id uint64, _ uint64, fb []byte) byte {
 		f, err := protocol.Decode(fb)
 		if err != nil {
 			return protocol.AckFail

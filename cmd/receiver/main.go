@@ -93,9 +93,9 @@ func run() error {
 		return err
 	}
 
-	// TCP 服务器
-	srv := transport.NewServer(cfg.ServerConfig(), func(connID uint64, frameBytes []byte) byte {
-		return handler.HandleFrame(connID, frameBytes)
+	// TCP 服务器（frameIdx：连接内数据帧到达序号，供 receiver 缺口闭合判定首帧）
+	srv := transport.NewServer(cfg.ServerConfig(), func(connID uint64, frameIdx uint64, frameBytes []byte) byte {
+		return handler.HandleFrame(connID, frameIdx, frameBytes)
 	})
 	if err := srv.Listen(); err != nil {
 		return fmt.Errorf("listen %s: %w", cfg.TCP.Listen, err)

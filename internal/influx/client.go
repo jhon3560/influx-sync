@@ -395,8 +395,18 @@ func (c *Client) ensureSchema(ctx context.Context, measurement string, tagColumn
 	if err == nil {
 		entry.fetchedAt = time.Now()
 		c.schemaCache[measurement] = entry
+	} else if prev, ok := c.schemaCache[measurement]; ok && !prev.degraded {
+		// N8：复用上一份成功 schema（即使已过期）——降级期类型保持正确，
+		// 避免未知列被写成 string field → 发现恢复后类型冲突成毒丸。
+		// 短 TTL 负缓存：30s 后重试发现。
+		prev.fetchedAt = time.Now()
+		prev.degraded = true
+		c.schemaCache[measurement] = prev
+		entry = prev
+		zap.L().Warn("influx: schema discovery failed, reusing last good schema (retry in 30s)",
+			zap.String("measurement", measurement), zap.Error(err))
 	} else {
-		// 降级：类型推断兜底 + 短 TTL 负缓存（到期重试，不向调用方传播）
+		// 无历史可复用：降级为类型推断兜底 + 短 TTL 负缓存（到期重试，不向调用方传播）
 		entry.degraded = true
 		entry.fetchedAt = time.Now()
 		c.schemaCache[measurement] = entry

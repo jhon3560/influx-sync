@@ -92,8 +92,8 @@ func startReceiverSrv(t *testing.T, targetURL string, lastSeqFile string) (*rece
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := transport.NewServer(transport.ServerConfig{Listen: "127.0.0.1:0"}, func(id uint64, fb []byte) byte {
-		return h.HandleFrame(id, fb)
+	srv := transport.NewServer(transport.ServerConfig{Listen: "127.0.0.1:0"}, func(id uint64, fidx uint64, fb []byte) byte {
+		return h.HandleFrame(id, fidx, fb)
 	})
 	if err := srv.Listen(); err != nil {
 		t.Fatal(err)
@@ -221,7 +221,7 @@ func TestEndToEndRestartRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ack := rs.handler.HandleFrame(1, fb); ack != 0xff {
+	if ack := rs.handler.HandleFrame(1, 0, fb); ack != 0xff {
 		t.Fatalf("ack=%x", ack)
 	}
 	if targetLines.Load() != 1 {

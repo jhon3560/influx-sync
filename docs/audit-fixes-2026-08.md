@@ -168,3 +168,39 @@ lastSeq 去重保证不重复计数）。
 | 中继 DLQ 二级失败仅记日志 | relay.md 明示降级边界 |
 
 全部测试（含 -race）通过。
+
+---
+
+## V1.4.2 修复记录（2026-08-14，复审 N6-N8）
+
+### N6（P1，N2 引入的操作级回归）：永久小缺口冻结 last_seq + 逐帧告警刷屏
+
+last_seq 文件按 1s 节流持久化，每次正常重启都会产生 ≤ 上次节流点的永久缺口；
+seqTracker 连续前缀推进下 last_seq 永久冻结、后续每帧命中 seq jump Warn 分支
+（~7 行/秒，58 万行/天）、"seq≤lastSeq" 去重完全失效（正确性由幂等重写兜底）。
+
+**修复（发送方权威闭合）**：新连接首帧 = sender WAL 头（tcp_server 读帧循环按序
+分配 frameIdx，心跳不计入，确定性免竞态）；若 seq > last+1，[last+1, seq-1] 在
+sender 侧已 Commit（"0xff=已落库"保证它们完成于旧进程，不可能在途）→ 安全
+markDone 闭合，last_seq 恢复连续推进、去重恢复、告警刷屏消失。
+双保险：缺口区间必须全部不在途才闭合（防多 sender 误配病态场景）。
+重复 seq jump 告警降级为 Debug（首条保留）。
+
+回归测试：TestGapClosedOnRestartWithStaleFile / TestGapNotClosedMidConnection /
+TestGapNotClosedWhileInFlight（阻塞式假库钉住"在途"状态）。
+
+### N7（P2，历史遗留）：新 WAL 首帧 seq=1 而非 0
+
+确认属实（NextSeq 空索引时被顶升到 1）。**不改**：data seq=0 会被 receiver 首帧
+去重（seq≤lastSeq=0）直接吞掉，且 seq=0 已被心跳占用（按类型先于去重检查）。
+已文档化：seq 从 1 开始是有意行为。
+
+### N8（P2，N5 残余）：降级期 tag 列写成 string field → 恢复后类型冲突毒丸
+
+**修复**：元查询失败时若存在该 measurement 的上一份成功 schema（即使已过期），
+**复用旧 schema**（类型不漂移、不产生毒丸），degraded 短 TTL 30s 后重试发现；
+无历史时才退到类型推断。文档同步：tag_columns 显式配置列为推荐项（完全绕开
+此路径）。
+回归测试：TestSchemaReuseLastGoodOnMetaFailure。
+
+全部测试（含 -race）通过。

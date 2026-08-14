@@ -101,7 +101,11 @@ func Open(dir string, segSize int64) (*WAL, error) {
 	if err := w.scanSegments(); err != nil {
 		return nil, err
 	}
-	// 恢复 next_seq：不得小于 checkpoint 与已扫描帧最大值
+	// 恢复 next_seq：不得小于 checkpoint 与已扫描帧最大值。
+	// N7 说明：即使索引为空（新 WAL），NextSeq 也从 0 顶升到 1——首帧 seq 从 1
+	// 开始是**有意行为**：data seq=0 会被 receiver 的 "seq<=lastSeq(0)" 首帧
+	// 去重直接吞掉（last_seq 初始为 0）；seq=0 保留给心跳帧（按类型先于去重
+	// 检查处理，不占用数据 seq 空间）。
 	var maxSeq uint64
 	for _, fi := range w.index {
 		if fi.seq > maxSeq {

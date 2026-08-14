@@ -69,7 +69,7 @@ func TestHandleDataFrame(t *testing.T) {
 	srv, writeCount, written := fakeTarget(t, false)
 	r := newTestReceiver(t, srv, Config{})
 	fb, _ := protocol.EncodeData(1, []byte("m,plant=A01 value=220.5 1720000000000000000"))
-	ack := r.HandleFrame(1, fb)
+	ack := r.HandleFrame(1, 0, fb)
 	if ack != protocol.AckSuccess {
 		t.Fatalf("ack=%x", ack)
 	}
@@ -90,7 +90,7 @@ func TestHandleBadCRC(t *testing.T) {
 	r := newTestReceiver(t, srv, Config{})
 	fb, _ := protocol.EncodeData(1, []byte("m value=1 1"))
 	fb[len(fb)-1] ^= 0xff
-	ack := r.HandleFrame(1, fb)
+	ack := r.HandleFrame(1, 0, fb)
 	if ack != protocol.AckFail {
 		t.Fatalf("ack=%x, want 0x00", ack)
 	}
@@ -103,11 +103,11 @@ func TestHandleDuplicateSeq(t *testing.T) {
 	srv, writeCount, _ := fakeTarget(t, false)
 	r := newTestReceiver(t, srv, Config{})
 	fb, _ := protocol.EncodeData(1, []byte("m value=1 1"))
-	if ack := r.HandleFrame(1, fb); ack != protocol.AckSuccess {
+	if ack := r.HandleFrame(1, 0, fb); ack != protocol.AckSuccess {
 		t.Fatalf("first ack=%x", ack)
 	}
 	// 重发同 seq
-	if ack := r.HandleFrame(1, fb); ack != protocol.AckSuccess {
+	if ack := r.HandleFrame(1, 0, fb); ack != protocol.AckSuccess {
 		t.Fatalf("dup ack=%x", ack)
 	}
 	if writeCount.Load() != 1 {
@@ -119,7 +119,7 @@ func TestHandleHeartbeat(t *testing.T) {
 	srv, writeCount, _ := fakeTarget(t, false)
 	r := newTestReceiver(t, srv, Config{})
 	fb, _ := protocol.EncodeHeartbeat(999)
-	if ack := r.HandleFrame(1, fb); ack != protocol.AckSuccess {
+	if ack := r.HandleFrame(1, 0, fb); ack != protocol.AckSuccess {
 		t.Fatalf("heartbeat ack=%x", ack)
 	}
 	if writeCount.Load() != 0 {
@@ -134,7 +134,7 @@ func TestHandleWriteFailure(t *testing.T) {
 	srv, _, _ := fakeTarget(t, true)
 	r := newTestReceiver(t, srv, Config{})
 	fb, _ := protocol.EncodeData(1, []byte("m value=1 1"))
-	if ack := r.HandleFrame(1, fb); ack != protocol.AckFail {
+	if ack := r.HandleFrame(1, 0, fb); ack != protocol.AckFail {
 		t.Fatalf("ack=%x, want 0x00", ack)
 	}
 	if r.LastSeq() != 0 {
@@ -148,7 +148,7 @@ func TestLastSeqPersistence(t *testing.T) {
 	srv, _, _ := fakeTarget(t, false)
 	r := newTestReceiver(t, srv, Config{LastSeqFile: seqFile})
 	fb, _ := protocol.EncodeData(1, []byte("m value=1 1"))
-	r.HandleFrame(1, fb)
+	r.HandleFrame(1, 0, fb)
 	if r.LastSeq() != 1 {
 		t.Fatalf("last_seq=%d", r.LastSeq())
 	}
@@ -159,7 +159,7 @@ func TestLastSeqPersistence(t *testing.T) {
 	}
 	// 旧 seq 直接 ACK 且不写库
 	fbOld, _ := protocol.EncodeData(0, []byte("m value=1 1"))
-	if ack := r2.HandleFrame(1, fbOld); ack != protocol.AckSuccess {
+	if ack := r2.HandleFrame(1, 0, fbOld); ack != protocol.AckSuccess {
 		t.Fatalf("old seq ack=%x", ack)
 	}
 }
@@ -196,7 +196,7 @@ func TestPoisonPacketIsolated(t *testing.T) {
 	srv, writeCount := fakeTargetCode(t, 400, "partial write: field type conflict")
 	r := newTestReceiver(t, srv, Config{DLQDir: dlqDir})
 	fb, _ := protocol.EncodeData(1, []byte("telemetry,plant=A01,point=P001 value=\"abc\" 1786234200000000000"))
-	ack := r.HandleFrame(1, fb)
+	ack := r.HandleFrame(1, 0, fb)
 	if ack != protocol.AckSuccess {
 		t.Fatalf("poison must get deceptive ack 0xff, got %x", ack)
 	}
@@ -229,7 +229,7 @@ func TestPoisonPacketIsolated(t *testing.T) {
 		t.Fatal("payload base64 missing")
 	}
 	// 重发同帧：LRU/last_seq 去重，不再写库、不重复 DLQ
-	if ack := r.HandleFrame(1, fb); ack != protocol.AckSuccess {
+	if ack := r.HandleFrame(1, 0, fb); ack != protocol.AckSuccess {
 		t.Fatalf("dup ack=%x", ack)
 	}
 	if writeCount.Load() != 1 {
@@ -247,7 +247,7 @@ func TestTransientErrorRetries(t *testing.T) {
 	srv, _ := fakeTargetCode(t, 500, "internal error")
 	r := newTestReceiver(t, srv, Config{DLQDir: dlqDir})
 	fb, _ := protocol.EncodeData(1, []byte("m value=1 1"))
-	if ack := r.HandleFrame(1, fb); ack != protocol.AckFail {
+	if ack := r.HandleFrame(1, 0, fb); ack != protocol.AckFail {
 		t.Fatalf("transient must get 0x00, got %x", ack)
 	}
 	if r.LastSeq() != 0 {
@@ -287,11 +287,11 @@ func TestTransientFailureRetryNotSwallowed(t *testing.T) {
 	defer srv.Close()
 	r := newTestReceiver(t, srv, Config{})
 	fb, _ := protocol.EncodeData(1, []byte("m value=1 1"))
-	if ack := r.HandleFrame(1, fb); ack != protocol.AckFail {
+	if ack := r.HandleFrame(1, 0, fb); ack != protocol.AckFail {
 		t.Fatalf("first ack=%x, want 0x00", ack)
 	}
 	fail.Store(false) // 目标库恢复
-	if ack := r.HandleFrame(1, fb); ack != protocol.AckSuccess {
+	if ack := r.HandleFrame(1, 0, fb); ack != protocol.AckSuccess {
 		t.Fatalf("retry ack=%x, want 0xff", ack)
 	}
 	if writes.Load() != 2 {
@@ -325,7 +325,7 @@ func TestRelayAppendFailureGoesToDLQ(t *testing.T) {
 	r := newTestReceiver(t, srv, Config{RelayWAL: relayWAL, RelayDLQDir: relayDLQ})
 	fb, _ := protocol.EncodeData(1, []byte("m value=1 1"))
 	// 写目标库成功 + 中继 append 失败：仍回 0xff（主链路畅通），但数据必须进 relay DLQ
-	if ack := r.HandleFrame(1, fb); ack != protocol.AckSuccess {
+	if ack := r.HandleFrame(1, 0, fb); ack != protocol.AckSuccess {
 		t.Fatalf("ack=%x, want 0xff", ack)
 	}
 	if writeCount.Load() != 1 {
@@ -421,8 +421,8 @@ func TestOrderedReceiverNoAdvancePastInFlight(t *testing.T) {
 	var wg sync.WaitGroup
 	var ack1, ack2 byte
 	wg.Add(2)
-	go func() { defer wg.Done(); ack1 = r.HandleFrame(1, fb1) }()
-	go func() { defer wg.Done(); ack2 = r.HandleFrame(1, fb2) }()
+	go func() { defer wg.Done(); ack1 = r.HandleFrame(1, 0, fb1) }()
+	go func() { defer wg.Done(); ack2 = r.HandleFrame(1, 1, fb2) }()
 	wg.Wait()
 	if ack1 != protocol.AckFail {
 		t.Fatalf("ack1=%x, want 0x00", ack1)
@@ -435,14 +435,14 @@ func TestOrderedReceiverNoAdvancePastInFlight(t *testing.T) {
 		t.Fatalf("last_seq=%d, must not advance past in-flight seq 1", r.LastSeq())
 	}
 	// 帧 1 重传成功 → last_seq 连续推进到 2
-	if ack := r.HandleFrame(1, fb1); ack != protocol.AckFail {
+	if ack := r.HandleFrame(1, 2, fb1); ack != protocol.AckFail {
 		t.Fatalf("retry1 ack=%x (server still failing value=1)", ack)
 	}
 	if r.LastSeq() != 0 {
 		t.Fatalf("last_seq=%d after failed retry", r.LastSeq())
 	}
 	// 帧 2 重传（已被 LRU 去重）：不重复写、不破坏连续推进
-	if ack := r.HandleFrame(1, fb2); ack != protocol.AckSuccess {
+	if ack := r.HandleFrame(1, 3, fb2); ack != protocol.AckSuccess {
 		t.Fatalf("dup2 ack=%x", ack)
 	}
 	if r.LastSeq() != 0 {
@@ -455,7 +455,7 @@ func TestPoisonNoDLQDirFallsBackToNack(t *testing.T) {
 	srv, _ := fakeTargetCode(t, 400, "bad request")
 	r := newTestReceiver(t, srv, Config{}) // 无 DLQDir
 	fb, _ := protocol.EncodeData(1, []byte("m value=1 1"))
-	if ack := r.HandleFrame(1, fb); ack != protocol.AckFail {
+	if ack := r.HandleFrame(1, 0, fb); ack != protocol.AckFail {
 		t.Fatalf("must fall back to 0x00, got %x", ack)
 	}
 	if r.LastSeq() != 0 {
@@ -502,12 +502,12 @@ func TestSeqJumpTooLargeAccepted(t *testing.T) {
 	r := newTestReceiver(t, srv, Config{})
 	// 先正常处理 seq=1
 	fb1, _ := protocol.EncodeData(1, []byte("m value=1 1"))
-	if ack := r.HandleFrame(1, fb1); ack != protocol.AckSuccess {
+	if ack := r.HandleFrame(1, 0, fb1); ack != protocol.AckSuccess {
 		t.Fatalf("ack=%x", ack)
 	}
 	// 跳跃 100 万：接受（幂等覆盖），推进 last_seq
 	fbBig, _ := protocol.EncodeData(1_000_001, []byte("m value=2 2"))
-	if ack := r.HandleFrame(1, fbBig); ack != protocol.AckSuccess {
+	if ack := r.HandleFrame(1, 1, fbBig); ack != protocol.AckSuccess {
 		t.Fatalf("big jump must be accepted, got %x", ack)
 	}
 	if r.LastSeq() != 1_000_001 {
@@ -519,26 +519,143 @@ func TestSeqJumpTooLargeAccepted(t *testing.T) {
 }
 
 func TestSeqSmallJumpAllowed(t *testing.T) {
-	// 小跳跃（如 sender 重启后 seq 连续性轻微断档）仍**接受处理**（0xff，不拒绝）；
-	// N2：last_seq 只按连续前缀推进（恒开 seqTracker），跳过的 seq 不等永不来的
-	// 缺口帧——正确性由幂等重写兜底：重传帧会被再次写入（At-Least-Once）。
+	// 新连接首帧小跳跃（sender 重启/WAL 头推进场景）：N6 永久缺口闭合——
+	// 首帧 seq= sender WAL 头，[1..4] 在 sender 侧已 Commit（0xff=已落库），
+	// 安全闭合后 last_seq 连续推进。
 	srv, writeCount, _ := fakeTarget(t, false)
 	r := newTestReceiver(t, srv, Config{})
-	fb, _ := protocol.EncodeData(5, []byte("m value=1 1")) // last_seq=0，跳 5
-	if ack := r.HandleFrame(1, fb); ack != protocol.AckSuccess {
+	fb, _ := protocol.EncodeData(5, []byte("m value=1 1")) // last_seq=0，新连接首帧跳 5
+	if ack := r.HandleFrame(7, 0, fb); ack != protocol.AckSuccess {
 		t.Fatalf("small jump ack=%x", ack)
 	}
-	if r.LastSeq() != 0 {
-		t.Fatalf("last_seq=%d, must not advance past permanent gap (contiguous advancement)", r.LastSeq())
+	if r.LastSeq() != 5 {
+		t.Fatalf("last_seq=%d, want 5 (gap closed via sender wal head on new conn first frame)", r.LastSeq())
 	}
 	if writeCount.Load() != 1 {
 		t.Fatalf("write count=%d", writeCount.Load())
 	}
-	// 重传同 seq：不再有 LRU，走幂等重写（数据不丢，允许重复写）
-	if ack := r.HandleFrame(1, fb); ack != protocol.AckSuccess {
+	// 重传同 seq：连续前缀去重（不再幂等重写）
+	if ack := r.HandleFrame(7, 1, fb); ack != protocol.AckSuccess {
 		t.Fatalf("retry ack=%x", ack)
 	}
-	if writeCount.Load() != 2 {
-		t.Fatalf("retry must be idempotently rewritten (writes=%d), never silently swallowed", writeCount.Load())
+	if writeCount.Load() != 1 {
+		t.Fatalf("retry must be deduped (writes=%d)", writeCount.Load())
+	}
+}
+
+// TestGapClosedOnRestartWithStaleFile N6 回归：重启后 last_seq 文件节流落后，
+// 新连接首帧（sender WAL 头）闭合缺口 → last_seq 恢复连续推进，后续帧不再告警跳跃。
+func TestGapClosedOnRestartWithStaleFile(t *testing.T) {
+	dir := t.TempDir()
+	seqFile := filepath.Join(dir, "last_seq")
+	srv, _, _ := fakeTarget(t, false)
+	r := newTestReceiver(t, srv, Config{LastSeqFile: seqFile})
+	// 旧进程处理 1..5（内存 last_seq=5；文件节流可能只存了 3）
+	for i := uint64(1); i <= 5; i++ {
+		fb, _ := protocol.EncodeData(i, []byte("m value=1 1"))
+		if ack := r.HandleFrame(1, i-1, fb); ack != protocol.AckSuccess {
+			t.Fatalf("seq %d ack=%x", i, ack)
+		}
+	}
+	if r.LastSeq() != 5 {
+		t.Fatalf("last_seq=%d", r.LastSeq())
+	}
+	// 模拟重启：文件落后于内存（=3）
+	if err := os.WriteFile(seqFile, []byte("3\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r2 := newTestReceiver(t, srv, Config{LastSeqFile: seqFile})
+	if r2.LastSeq() != 3 {
+		t.Fatalf("restored last_seq=%d, want 3", r2.LastSeq())
+	}
+	// sender 重连首帧 = WAL 头 6（1..5 已 Commit）：缺口 [4,5] 应被闭合
+	fb, _ := protocol.EncodeData(6, []byte("m value=1 1"))
+	if ack := r2.HandleFrame(99, 0, fb); ack != protocol.AckSuccess {
+		t.Fatalf("ack=%x", ack)
+	}
+	if r2.LastSeq() != 6 {
+		t.Fatalf("last_seq=%d, want 6 (gap [4,5] closed via sender wal head)", r2.LastSeq())
+	}
+	// 后续帧连续推进
+	fb7, _ := protocol.EncodeData(7, []byte("m value=1 1"))
+	if ack := r2.HandleFrame(99, 1, fb7); ack != protocol.AckSuccess {
+		t.Fatalf("ack=%x", ack)
+	}
+	if r2.LastSeq() != 7 {
+		t.Fatalf("last_seq=%d, want 7", r2.LastSeq())
+	}
+}
+
+// TestGapNotClosedMidConnection 同一连接的非首帧缺口不闭合（首帧才是 sender WAL 头）。
+func TestGapNotClosedMidConnection(t *testing.T) {
+	srv, _, _ := fakeTarget(t, false)
+	r := newTestReceiver(t, srv, Config{})
+	fb1, _ := protocol.EncodeData(1, []byte("m value=1 1"))
+	r.HandleFrame(3, 0, fb1) // 连接 3 首帧 = 1
+	if r.LastSeq() != 1 {
+		t.Fatalf("last_seq=%d", r.LastSeq())
+	}
+	// 同连接上帧 5（缺口 2..4）：非首帧，不得闭合
+	fb5, _ := protocol.EncodeData(5, []byte("m value=1 1"))
+	if ack := r.HandleFrame(3, 1, fb5); ack != protocol.AckSuccess {
+		t.Fatalf("ack=%x", ack)
+	}
+	if r.LastSeq() != 1 {
+		t.Fatalf("last_seq=%d, must not close gap mid-connection", r.LastSeq())
+	}
+	// 补齐 2 → 连续推进到 2
+	fb2, _ := protocol.EncodeData(2, []byte("m value=1 1"))
+	r.HandleFrame(3, 2, fb2)
+	if r.LastSeq() != 2 {
+		t.Fatalf("last_seq=%d, want 2", r.LastSeq())
+	}
+}
+
+// TestGapNotClosedWhileInFlight 缺口帧仍在途时不闭合（双保险，防吞重传）。
+// 用阻塞式假目标库把 seq=1 确定性地钉在"在途"状态。
+func TestGapNotClosedWhileInFlight(t *testing.T) {
+	block := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/write" {
+			http.NotFound(w, r)
+			return
+		}
+		buf := make([]byte, 1<<20)
+		n, _ := r.Body.Read(buf)
+		if strings.Contains(string(buf[:n]), "slow") {
+			close(block)                                  // 已进入写库（在途）
+			<-release                                     // 阻塞直到测试放行
+			w.WriteHeader(http.StatusInternalServerError) // 瞬时失败
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	r := newTestReceiver(t, srv, Config{})
+	// 连接 1 首帧 seq=1：无缺口，在途（阻塞写库中）
+	fb1, _ := protocol.EncodeData(1, []byte("m slow=1 1"))
+	var ack1 byte
+	done := make(chan struct{})
+	go func() { ack1 = r.HandleFrame(1, 0, fb1); close(done) }()
+	<-block // 确保 1 已进入写库（在途）
+	// 连接 2 首帧 seq=2：缺口 [1] 在途 → 不得闭合（1 重传会被吞）
+	fb2, _ := protocol.EncodeData(2, []byte("m value=2 2"))
+	if ack := r.HandleFrame(2, 0, fb2); ack != protocol.AckSuccess {
+		t.Fatalf("ack2=%x", ack)
+	}
+	if r.LastSeq() != 0 {
+		t.Fatalf("last_seq=%d, must not close gap while seq 1 in-flight", r.LastSeq())
+	}
+	close(release)
+	<-done
+	_ = ack1
+	// 帧 1 重传成功（新连接首帧）：无缺口，正常推进到 2
+	fb1ok, _ := protocol.EncodeData(1, []byte("m fast=1 1"))
+	if ack := r.HandleFrame(3, 0, fb1ok); ack != protocol.AckSuccess {
+		t.Fatalf("retry1 ack=%x", ack)
+	}
+	if r.LastSeq() != 2 {
+		t.Fatalf("last_seq=%d, want 2 (1 completed + 2 pending run)", r.LastSeq())
 	}
 }

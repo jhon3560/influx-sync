@@ -40,6 +40,14 @@ type Receiver struct {
 	cfg     Config
 	lastSeq atomic.Int64 // 已成功处理的最大连续 seq（内存；只增不减）
 	seqOrd  *seqTracker  // 按序 seq 推进器（N2：恒开——流水线/多连接下乱序完成安全）
+	// N6：永久缺口闭合（发送方权威）。frameIdx 由 tcp_server 读帧循环按序分配
+	// （数据帧计数、心跳不计入）：frameIdx==0 即"新连接首帧"= sender WAL 头。
+	// 若 seq > lastSeq+1，说明 [lastSeq+1, seq-1] 已在 sender 侧 Commit
+	// （"0xff=已落库"保证它们完成于旧进程），可安全 markDone 闭合。
+	// 双保险：缺口区间必须全部不在途（防多 sender 误配场景）。
+	inflightMu  sync.Mutex
+	inflightSeq map[uint64]struct{} // 当前在途帧 seq
+	gapWarned   atomic.Uint64       // 上次 Warn 的缺口首帧 seq（日志节流）
 
 	persistMu sync.Mutex
 	persistAt time.Time // last_seq 持久化节流（每秒最多一次）
@@ -49,10 +57,16 @@ type Receiver struct {
 // last_seq 采用**连续前缀推进**语义（seqTracker 恒开，N2）：
 // 乱序完成的帧只记入 pending，绝不把 last_seq 推过未完成的在途帧——
 // 否则该帧瞬时失败后的重传会被 "seq<=last_seq" 吞掉（数据丢失）。
-// 停等 sender 下帧严格按序到达，行为与旧 max 推进一致；小缺口（如双方
-// last_seq/WAL 同时丢失）不再推进 last_seq，但正确性由幂等重写兜底。
+// 永久缺口（重启后 last_seq 文件节流落后）由新连接首帧闭合（N6）。
 func New(client *influx.Client, metrics *monitor.Metrics, logger *zap.Logger, cfg Config) (*Receiver, error) {
-	r := &Receiver{client: client, metrics: metrics, logger: logger, cfg: cfg, seqOrd: newSeqTracker()}
+	r := &Receiver{
+		client:      client,
+		metrics:     metrics,
+		logger:      logger,
+		cfg:         cfg,
+		seqOrd:      newSeqTracker(),
+		inflightSeq: make(map[uint64]struct{}),
+	}
 	if cfg.LastSeqFile != "" {
 		seq, err := loadLastSeq(cfg.LastSeqFile)
 		if err != nil {
@@ -66,7 +80,9 @@ func New(client *influx.Client, metrics *monitor.Metrics, logger *zap.Logger, cf
 }
 
 // HandleFrame 处理一帧，返回 ACK 字节。线程安全（多连接/并发流水线可调用）。
-func (r *Receiver) HandleFrame(connID uint64, frameBytes []byte) byte {
+// frameIdx：该连接内数据帧的到达序号（0 起，由 tcp_server 按序分配）——
+// frameIdx==0 即新连接首帧（sender WAL 头），用于 N6 永久缺口闭合。
+func (r *Receiver) HandleFrame(connID uint64, frameIdx uint64, frameBytes []byte) byte {
 	r.metrics.IncRecv()
 	f, err := protocol.Decode(frameBytes)
 	if err != nil {
@@ -87,19 +103,36 @@ func (r *Receiver) HandleFrame(connID uint64, frameBytes []byte) byte {
 		return protocol.AckSuccess
 	}
 
-	// 在途帧计数（指标；替代 V1.4 写死的 LRU——LRU 查询结果无人消费属废状态）
+	// 在途登记（N6 缺口闭合双保险 + recv_inflight 指标）
 	r.metrics.IncInflight()
 	defer r.metrics.DecInflight()
+	r.addInflight(f.Seq)
+	defer r.removeInflight(f.Seq)
 
-	// seq 跳跃告警但不拒绝：Influx 幂等覆盖保证最终一致，
-	// 拒绝会导致 Sender 停等重发同一帧、链路永久卡死（如 last_seq 文件被
-	// 清理后重启，Sender WAL 仍有高位 seq 积压的场景）。
-	if f.Seq > uint64(r.lastSeq.Load())+1 {
-		if f.Seq > uint64(r.lastSeq.Load())+seqJumpLimit {
-			r.logger.Error("seq jump too large, frame accepted anyway (idempotent overwrite)",
-				zap.Uint64("seq", f.Seq), zap.Int64("last_seq", r.lastSeq.Load()))
+	// seq 跳跃处理：接受但不拒绝（Influx 幂等覆盖保证最终一致，拒绝会导致
+	// Sender 停等重发同一帧、链路永久卡死）。
+	// N6：永久缺口（重启后 last_seq 文件节流落后）由新连接首帧闭合——
+	// 避免 last_seq 冻结 + 逐帧 Warn 刷屏 + 去重失效。
+	last := uint64(r.lastSeq.Load())
+	if f.Seq > last+1 {
+		if f.Seq > last+seqJumpLimit {
+			// 大跳跃（双方持久化重置）：tracker 在 markDone 时直接越过；日志节流
+			if r.gapWarned.CompareAndSwap(0, f.Seq) {
+				r.logger.Error("seq jump too large, frame accepted anyway (idempotent overwrite)",
+					zap.Uint64("seq", f.Seq), zap.Int64("last_seq", r.lastSeq.Load()))
+			} else {
+				r.logger.Debug("seq jump (repeated)", zap.Uint64("seq", f.Seq), zap.Int64("last_seq", r.lastSeq.Load()))
+			}
+		} else if frameIdx == 0 && r.tryCloseGap(f.Seq) {
+			r.logger.Info("permanent seq gap closed via sender wal head",
+				zap.Uint64("seq", f.Seq), zap.Int64("last_seq", r.lastSeq.Load()), zap.Uint64("conn", connID))
 		} else {
-			r.logger.Warn("seq jump", zap.Uint64("seq", f.Seq), zap.Int64("last_seq", r.lastSeq.Load()))
+			// 无法安全闭合（在途冲突/非首帧）：日志节流，首条 Warn 后续 Debug
+			if r.gapWarned.CompareAndSwap(0, f.Seq) {
+				r.logger.Warn("seq jump", zap.Uint64("seq", f.Seq), zap.Int64("last_seq", r.lastSeq.Load()))
+			} else {
+				r.logger.Debug("seq jump (repeated)", zap.Uint64("seq", f.Seq), zap.Int64("last_seq", r.lastSeq.Load()))
+			}
 		}
 	}
 
@@ -211,6 +244,42 @@ func (r *Receiver) markDone(seq uint64) {
 	r.advanceSeq(r.seqOrd.load())
 }
 
+// addInflight / removeInflight 维护在途帧集合（N6 缺口闭合双保险）。
+func (r *Receiver) addInflight(seq uint64) {
+	r.inflightMu.Lock()
+	r.inflightSeq[seq] = struct{}{}
+	r.inflightMu.Unlock()
+}
+
+func (r *Receiver) removeInflight(seq uint64) {
+	r.inflightMu.Lock()
+	delete(r.inflightSeq, seq)
+	r.inflightMu.Unlock()
+}
+
+// tryCloseGap 尝试闭合永久缺口（N6）：
+// 前提是调用方已确认本帧为新连接首帧（frameIdx==0，首帧= sender WAL 头）。
+// 若 seq > last+1，则 [last+1, seq-1] 在 sender 侧已 Commit（否则 WAL 头不会
+// 推进到 seq），"0xff=已落库" 保证它们已在 receiver 旧进程完成（不可能在途），
+// 可安全闭合。双保险：缺口区间必须全部不在途（防多 sender 误配等病态场景）。
+func (r *Receiver) tryCloseGap(seq uint64) bool {
+	last := uint64(r.lastSeq.Load())
+	if seq <= last+1 {
+		return false
+	}
+	// 双保险：缺口区间全部不在途才闭合
+	r.inflightMu.Lock()
+	defer r.inflightMu.Unlock()
+	for s := last + 1; s < seq; s++ {
+		if _, infl := r.inflightSeq[s]; infl {
+			return false
+		}
+	}
+	r.seqOrd.closeGap(seq - 1)
+	r.advanceSeq(r.seqOrd.load())
+	return true
+}
+
 // advanceSeq 推进 last_seq（只增不减 CAS）+ 节流持久化。
 // 持久化节流为每秒最多一次：崩溃窗口内丢失的推进由 Sender 重发 + Influx
 // 幂等覆盖兜底（At-Least-Once 不受影响）。
@@ -303,6 +372,21 @@ func (t *seqTracker) init(v uint64) {
 	defer t.mu.Unlock()
 	t.last = v
 	t.pending = make(map[uint64]struct{})
+}
+
+// closeGap 直接推进连续值到 upTo（永久缺口闭合，N6）。
+// 调用方必须保证 [last+1, upTo] 的帧已完成（发送方权威判定）。
+func (t *seqTracker) closeGap(upTo uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if upTo > t.last {
+		t.last = upTo
+	}
+	for s := range t.pending {
+		if s <= t.last {
+			delete(t.pending, s)
+		}
+	}
 }
 
 // done 记录 seq 完成；返回是否推进了 last_seq。

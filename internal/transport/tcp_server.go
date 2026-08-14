@@ -24,7 +24,10 @@ type ServerConfig struct {
 
 // FrameHandler 处理一帧完整数据，返回 ACK 字节（protocol.AckSuccess/AckFail）。
 // 可并发调用（A2：并发写库）；ACK 仍由 Server 按帧到达顺序写回。
-type FrameHandler func(connID uint64, frameBytes []byte) byte
+// frameIdx 为**该连接内数据帧的到达序号**（0 起，心跳不计入）：由 Server 读帧
+// 循环按序分配——确定性标识"新连接首帧"（= sender WAL 头），供 receiver
+// 缺口闭合（N6）使用，不受 handler goroutine 调度竞态影响。
+type FrameHandler func(connID uint64, frameIdx uint64, frameBytes []byte) byte
 
 // Server Receiver 侧 TCP 服务器：逐连接逐帧读取 → handler → 回 ACK。
 type Server struct {
@@ -206,6 +209,7 @@ func (s *Server) handleConn(ctx context.Context, id uint64, conn net.Conn) {
 	}()
 
 	var idx int64
+	var dataIdx uint64 // 数据帧到达序号（心跳不计入；首帧= sender WAL 头）
 	for {
 		select {
 		case <-ctx.Done():
@@ -229,13 +233,19 @@ func (s *Server) handleConn(ctx context.Context, id uint64, conn net.Conn) {
 		if _, err := io.ReadFull(conn, frameBytes[protocol.HeaderSize:]); err != nil {
 			return
 		}
+		// 数据帧序号：读帧循环按序分配（确定性首帧标识，N6）
+		fIdx := uint64(0)
+		if head.Type == protocol.TypeData {
+			fIdx = dataIdx
+			dataIdx++
+		}
 		// 在途窗口护栏（停等 sender 下恒为 1 帧在途，行为不变）
 		if !pipe.awaitInflight(idx, s.cfg.MaxInflight) {
 			return
 		}
-		go func(i int64, fb []byte) {
-			pipe.setResult(i, s.handler(id, fb))
-		}(idx, frameBytes)
+		go func(i int64, fidx uint64, fb []byte) {
+			pipe.setResult(i, s.handler(id, fidx, fb))
+		}(idx, fIdx, frameBytes)
 		idx++
 	}
 }

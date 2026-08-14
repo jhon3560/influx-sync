@@ -26,7 +26,9 @@ sync:
   signal_listen: ":18098"  # 订阅信号监听（源库 SUBSCRIPTION 推送目标）；空=纯轮询
   signal_min_interval: 200ms  # 信号最小查询间隔（V1.4：忙时信号延迟触发而非丢弃）
   backfill: 0s          # 首次启动回填时长（游标=now-watermark-backfill）
-  tag_columns: []       # 显式 tag 列（空=自动 SHOW TAG KEYS 发现）
+  tag_columns: []       # 显式 tag 列（空=自动 SHOW TAG KEYS 发现）。
+                        # 推荐显式配置：完全绕开 schema 降级期类型漂移风险（N8）；
+                        # 显式配置时不再查询 SHOW TAG KEYS（仍查 SHOW FIELD KEYS 取类型）
   measurements: []      # 同步的 measurement（空=全部 /.*/）
 
 wal:
