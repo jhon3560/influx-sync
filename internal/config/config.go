@@ -45,18 +45,25 @@ func (c *MonitorConfig) Auth() *monitor.Auth {
 type SenderConfig struct {
 	Source influx.Config `yaml:"source"`
 	Sync   struct {
-		Interval          string   `yaml:"interval"`            // 轮询周期
-		Window            string   `yaml:"window"`              // 查询窗口
-		Watermark         string   `yaml:"watermark"`           // 水位延迟
-		MaxWindow         string   `yaml:"max_window"`          // 窗口上限（防时间跳变）
-		BatchPoints       int      `yaml:"batch_points"`        // 单帧点数
-		QueryLimit        int      `yaml:"query_limit"`         // 单次查询 LIMIT（分页粒度）
-		ParallelQueries   int      `yaml:"poller_parallel"`     // 多窗口并行查询数（0=串行，默认4）
-		SignalListen      string   `yaml:"signal_listen"`       // 订阅信号监听地址（如 ":18098"）；空=纯轮询
-		SignalMinInterval string   `yaml:"signal_min_interval"` // 订阅信号最小查询间隔（默认 200ms）
-		Backfill          string   `yaml:"backfill"`            // 首次启动回填：游标初始化为 now-watermark-backfill
-		TagColumns        []string `yaml:"tag_columns"`         // 显式 tag 列（空=自动 SHOW TAG KEYS 发现）
-		Measurements      []string `yaml:"measurements"`        // 同步的 measurement 列表
+		Interval          string `yaml:"interval"`            // 轮询周期
+		Window            string `yaml:"window"`              // 查询窗口
+		Watermark         string `yaml:"watermark"`           // 水位延迟
+		MaxWindow         string `yaml:"max_window"`          // 窗口上限（防时间跳变）
+		BatchPoints       int    `yaml:"batch_points"`        // 单帧点数
+		QueryLimit        int    `yaml:"query_limit"`         // 单次查询 LIMIT（分页粒度）
+		ParallelQueries   int    `yaml:"poller_parallel"`     // 多窗口并行查询数（0=串行，默认4）
+		SignalListen      string `yaml:"signal_listen"`       // 订阅信号监听地址（如 ":18098"）；空=纯轮询
+		SignalMinInterval string `yaml:"signal_min_interval"` // 订阅信号最小查询间隔（默认 200ms）
+		FastPath          struct {
+			Listen        string `yaml:"listen"`         // A4 fast-path 订阅监听地址；空=禁用
+			Mode          string `yaml:"mode"`           // off=仅信号 / auto=游标追平自动启用（默认） / on=强制转发
+			ActivateAge   string `yaml:"activate_age"`   // auto：cursor 年龄 ≤ 此值启用（默认 watermark+3s）
+			DeactivateAge string `yaml:"deactivate_age"` // auto：年龄 > 此值退回仅信号（迟滞，默认 30s）
+			DedupWindow   string `yaml:"dedup_window"`   // 去重集保留窗口（默认 watermark+5s）
+		} `yaml:"fast_path"`
+		Backfill     string   `yaml:"backfill"`     // 首次启动回填：游标初始化为 now-watermark-backfill
+		TagColumns   []string `yaml:"tag_columns"`  // 显式 tag 列（空=自动 SHOW TAG KEYS 发现）
+		Measurements []string `yaml:"measurements"` // 同步的 measurement 列表
 	} `yaml:"sync"`
 	WAL struct {
 		Path        string `yaml:"path"`
@@ -195,17 +202,20 @@ func (c *SenderConfig) Validate() error {
 		return fmt.Errorf("config: wal.path required")
 	}
 	for name, s := range map[string]string{
-		"sync.interval":             c.Sync.Interval,
-		"sync.window":               c.Sync.Window,
-		"sync.watermark":            c.Sync.Watermark,
-		"sync.max_window":           c.Sync.MaxWindow,
-		"sync.signal_min_interval":  c.Sync.SignalMinInterval,
-		"sync.backfill":             c.Sync.Backfill,
-		"tcp.timeout":               c.TCP.Timeout,
-		"tcp.dial_timeout":          c.TCP.DialTimeout,
-		"sender.backoff_base":       c.Sender.BackoffBase,
-		"sender.backoff_max":        c.Sender.BackoffMax,
-		"sender.heartbeat_interval": c.Sender.HeartbeatInterval,
+		"sync.interval":                 c.Sync.Interval,
+		"sync.window":                   c.Sync.Window,
+		"sync.watermark":                c.Sync.Watermark,
+		"sync.max_window":               c.Sync.MaxWindow,
+		"sync.signal_min_interval":      c.Sync.SignalMinInterval,
+		"sync.fast_path.activate_age":   c.Sync.FastPath.ActivateAge,
+		"sync.fast_path.deactivate_age": c.Sync.FastPath.DeactivateAge,
+		"sync.fast_path.dedup_window":   c.Sync.FastPath.DedupWindow,
+		"sync.backfill":                 c.Sync.Backfill,
+		"tcp.timeout":                   c.TCP.Timeout,
+		"tcp.dial_timeout":              c.TCP.DialTimeout,
+		"sender.backoff_base":           c.Sender.BackoffBase,
+		"sender.backoff_max":            c.Sender.BackoffMax,
+		"sender.heartbeat_interval":     c.Sender.HeartbeatInterval,
 	} {
 		if err := validateDur(name, s); err != nil {
 			return err
@@ -213,6 +223,9 @@ func (c *SenderConfig) Validate() error {
 	}
 	if c.Sender.Pipeline < 0 {
 		return fmt.Errorf("config: sender.pipeline_window must be >= 0")
+	}
+	if m := c.Sync.FastPath.Mode; m != "" && m != "off" && m != "auto" && m != "on" {
+		return fmt.Errorf("config: sync.fast_path.mode must be off/auto/on, got %q", m)
 	}
 	return nil
 }
@@ -289,6 +302,18 @@ func (c *SenderConfig) PollerConfig() sender.PollerConfig {
 // WatermarkDuration 返回水位延迟。
 func (c *SenderConfig) WatermarkDuration() time.Duration {
 	return dur(c.Sync.Watermark, 10*time.Second)
+}
+
+// FastPathConfig 转换（A4 快路径）。
+func (c *SenderConfig) FastPathConfig() sender.FastPathConfig {
+	watermark := c.WatermarkDuration()
+	return sender.FastPathConfig{
+		Mode:          sender.FastPathMode(c.Sync.FastPath.Mode),
+		ActivateAge:   dur(c.Sync.FastPath.ActivateAge, watermark+3*time.Second),
+		DeactivateAge: dur(c.Sync.FastPath.DeactivateAge, 30*time.Second),
+		DedupWindow:   dur(c.Sync.FastPath.DedupWindow, watermark+5*time.Second),
+		Measurements:  c.Sync.Measurements,
+	}
 }
 
 // BackfillDuration 返回首次启动回填时长。

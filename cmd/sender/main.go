@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -100,6 +101,33 @@ func run() error {
 		go func() {
 			if err := sig.Run(ctx, cfg.Sync.SignalListen); err != nil {
 				log.Error("signal listener failed (fallback to polling)", zap.Error(err))
+			}
+		}()
+	}
+
+	// V1.5 A4 快路径：配置 fast_path.listen 时启动订阅透传（源库 SUBSCRIPTION 推送
+	// 直接进 WAL/链路；游标追平后自动激活，回填期仅作信号——见 docs/a4-fast-path.md）。
+	if cfg.Sync.FastPath.Listen != "" {
+		fp := sender.NewFastPath(walInst, metrics, log, cfg.FastPathConfig(),
+			poller.Notify, func() float64 { return sender.WalDiskUsageRatio(walInst.Dir()) })
+		poller.SetFastPath(fp)
+		metrics.SetFastPathState(1) // 初始 waiting（auto 下由游标年龄驱动激活）
+		if fp.Active() {
+			metrics.SetFastPathState(2)
+		}
+		go func() {
+			srv := &http.Server{
+				Addr:              cfg.Sync.FastPath.Listen,
+				Handler:           fp,
+				ReadHeaderTimeout: 5 * time.Second,
+			}
+			go func() {
+				<-ctx.Done()
+				_ = srv.Close()
+			}()
+			log.Info("fast path listener started", zap.String("addr", cfg.Sync.FastPath.Listen), zap.String("mode", cfg.Sync.FastPath.Mode))
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Error("fast path listener failed (fallback to polling)", zap.Error(err))
 			}
 		}()
 	}

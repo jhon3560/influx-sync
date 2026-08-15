@@ -415,41 +415,47 @@ func (w *WAL) appendEncodedLocked(typ uint8, seq uint64, frameBytes []byte) erro
 }
 
 // AppendBatch 一次追加多帧并在最后统一 fsync（group commit，P4）。
-// seqBase 必须等于 NextSeq，帧 seq 依次为 seqBase+i。
+// A4/V1.5：seq 由内部按 NextSeq 连续分配（不再由调用方传入 seqBase）——支持
+// Poller 与 FastPath 并发追加（消除 NextSeq 读-用间隙的 TOCTOU）。帧头的 seq
+// 字段会被重写为分配值（协议 CRC 只覆盖 payload，不受影响），返回各帧分配到的 seq。
 // 每轮 poll 的所有帧只 fsync 一次：游标本就在 append 之后才推进，
 // 崩溃时未 fsync 的尾部会因游标回退而重新查询，正确性不降。
-func (w *WAL) AppendBatch(typ uint8, seqBase uint64, frameBytes [][]byte) error {
+func (w *WAL) AppendBatch(typ uint8, frameBytes [][]byte) ([]uint64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if len(frameBytes) == 0 {
-		return nil
+		return nil, nil
 	}
-	if seqBase != w.cp.NextSeq {
-		return fmt.Errorf("wal: out-of-order append seq=%d next=%d", seqBase, w.cp.NextSeq)
-	}
+	seqs := make([]uint64, len(frameBytes))
 	for i, fb := range frameBytes {
-		if err := w.ensureSpace(len(fb) + recordHeadLen); err != nil {
-			return err
+		if len(fb) < protocol.HeaderSize {
+			return nil, fmt.Errorf("wal: frame too short: %d bytes", len(fb))
 		}
+		if err := w.ensureSpace(len(fb) + recordHeadLen); err != nil {
+			return nil, err
+		}
+		seqs[i] = w.cp.NextSeq
+		// 重写帧头 seq 字段（offset 4..12）：编码方可用占位 seq=0
+		binary.BigEndian.PutUint64(fb[4:12], seqs[i])
 		var head [recordHeadLen]byte
 		binary.BigEndian.PutUint32(head[:], uint32(len(fb)))
 		if _, err := w.curFile.Write(head[:]); err != nil {
-			return fmt.Errorf("wal: write record head: %w", err)
+			return nil, fmt.Errorf("wal: write record head: %w", err)
 		}
 		if _, err := w.curFile.Write(fb); err != nil {
-			return fmt.Errorf("wal: write frame: %w", err)
+			return nil, fmt.Errorf("wal: write frame: %w", err)
 		}
 		w.index = append(w.index, frameIndex{
-			seg: w.curSeg, offset: w.curOffset, length: len(fb), seq: seqBase + uint64(i), typ: typ,
+			seg: w.curSeg, offset: w.curOffset, length: len(fb), seq: seqs[i], typ: typ,
 		})
 		w.curOffset += recordHeadLen + int64(len(fb))
 		w.cp.NextSeq++
 	}
 	if err := w.curFile.Sync(); err != nil {
-		return fmt.Errorf("wal: fsync batch: %w", err)
+		return nil, fmt.Errorf("wal: fsync batch: %w", err)
 	}
 	w.notifyAppend()
-	return nil
+	return seqs, nil
 }
 
 // notifyAppend 非阻塞通知新帧到达（唤醒空闲 Sender，替代轮询 IdleSleep）。

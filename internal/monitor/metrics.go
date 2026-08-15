@@ -35,6 +35,16 @@ type Metrics struct {
 	lastWriteTs atomic.Int64  // receiver 最后落库点时间戳（ns，0=未知）
 	relayDLQ    atomic.Uint64 // relay_dlq_total：中继 WAL 失败转存计数
 	inflight    atomic.Int64  // receiver recv_inflight：在途处理帧数
+	// V1.5 A4 fast-path 新增
+	fpState    atomic.Int64  // fast_path_state: 0=off/1=waiting/2=active
+	fpBatch    atomic.Uint64 // fast_path_batches_total
+	fpPoints   atomic.Uint64 // fast_path_points_total
+	fpSigOnly  atomic.Uint64 // fast_path_signal_only_total（WAITING 期仅信号）
+	fpDropBig  atomic.Uint64 // fast_path_dropped_oversize_total
+	fpDropPrec atomic.Uint64 // fast_path_dropped_precision_total
+	fpDropBP   atomic.Uint64 // fast_path_dropped_backpressure_total
+	fpLineSkip atomic.Uint64 // fast_path_line_skipped_total
+	fpDedupHit atomic.Uint64 // fast_path_dedup_hits_total（Poller 侧命中）
 }
 
 // New 创建指标集合。
@@ -101,6 +111,45 @@ func (m *Metrics) IncRelayDLQ() { m.relayDLQ.Add(1) }
 
 // RelayDLQCount 返回中继转存计数（测试用）。
 func (m *Metrics) RelayDLQCount() uint64 { return m.relayDLQ.Load() }
+
+// --- V1.5 A4 fast-path 指标 ---
+
+func (m *Metrics) SetFastPathState(v int64)        { m.fpState.Store(v) }
+func (m *Metrics) IncFastPathBatch()               { m.fpBatch.Add(1) }
+func (m *Metrics) AddFastPathPoints(v int64)       { m.fpPoints.Add(uint64(v)) }
+func (m *Metrics) IncFastPathSignalOnly()          { m.fpSigOnly.Add(1) }
+func (m *Metrics) IncFastPathDroppedOversize()     { m.fpDropBig.Add(1) }
+func (m *Metrics) IncFastPathDroppedPrecision()    { m.fpDropPrec.Add(1) }
+func (m *Metrics) IncFastPathDroppedBackpressure() { m.fpDropBP.Add(1) }
+func (m *Metrics) IncFastPathLineSkipped()         { m.fpLineSkip.Add(1) }
+func (m *Metrics) IncFastPathDedupHit()            { m.fpDedupHit.Add(1) }
+
+// FastPathState 返回快路径状态（测试用）。
+func (m *Metrics) FastPathState() int64 { return m.fpState.Load() }
+
+// FastPathBatches 返回批计数（测试用）。
+func (m *Metrics) FastPathBatches() uint64 { return m.fpBatch.Load() }
+
+// FastPathPoints 返回点数（测试用）。
+func (m *Metrics) FastPathPoints() uint64 { return m.fpPoints.Load() }
+
+// FastPathSignalOnly 返回仅信号批计数（测试用）。
+func (m *Metrics) FastPathSignalOnly() uint64 { return m.fpSigOnly.Load() }
+
+// FastPathDroppedOversize 返回超限丢批计数（测试用）。
+func (m *Metrics) FastPathDroppedOversize() uint64 { return m.fpDropBig.Load() }
+
+// FastPathDroppedPrecision 返回精度丢批计数（测试用）。
+func (m *Metrics) FastPathDroppedPrecision() uint64 { return m.fpDropPrec.Load() }
+
+// FastPathDroppedBackpressure 返回反压丢批计数（测试用）。
+func (m *Metrics) FastPathDroppedBackpressure() uint64 { return m.fpDropBP.Load() }
+
+// FastPathLineSkipped 返回行跳过计数（测试用）。
+func (m *Metrics) FastPathLineSkipped() uint64 { return m.fpLineSkip.Load() }
+
+// FastPathDedupHit 返回去重命中计数（测试用）。
+func (m *Metrics) FastPathDedupHit() uint64 { return m.fpDedupHit.Load() }
 
 // IncInflight / DecInflight 维护 receiver 在途帧数（N2 小项：替代废弃 LRU 的可观测性）。
 func (m *Metrics) IncInflight() { m.inflight.Add(1) }
@@ -182,6 +231,33 @@ relay_dlq_total %d
 # HELP sync_e2e_delay_seconds 端到端延迟（now - 目标库最后写入点时间，0=未知）
 # TYPE sync_e2e_delay_seconds gauge
 sync_e2e_delay_seconds %d
+# HELP fast_path_state 快路径状态 0=off 1=waiting(仅信号) 2=active(透传)
+# TYPE fast_path_state gauge
+fast_path_state %d
+# HELP fast_path_batches_total 快路径收到推送批总数
+# TYPE fast_path_batches_total counter
+fast_path_batches_total %d
+# HELP fast_path_points_total 快路径转发点总数
+# TYPE fast_path_points_total counter
+fast_path_points_total %d
+# HELP fast_path_signal_only_total WAITING 期仅作信号的批数
+# TYPE fast_path_signal_only_total counter
+fast_path_signal_only_total %d
+# HELP fast_path_dropped_oversize_total 超限跳过批数（Poller 兜底）
+# TYPE fast_path_dropped_oversize_total counter
+fast_path_dropped_oversize_total %d
+# HELP fast_path_dropped_precision_total 非 ns 精度跳过批数（Poller 兜底）
+# TYPE fast_path_dropped_precision_total counter
+fast_path_dropped_precision_total %d
+# HELP fast_path_dropped_backpressure_total 反压跳过批数（Poller 兜底）
+# TYPE fast_path_dropped_backpressure_total counter
+fast_path_dropped_backpressure_total %d
+# HELP fast_path_line_skipped_total 逐行跳过行数（坏行/非 ns/非目标 measurement）
+# TYPE fast_path_line_skipped_total counter
+fast_path_line_skipped_total %d
+# HELP fast_path_dedup_hits_total Poller 侧去重命中点数（跳过已由快路径转发的点）
+# TYPE fast_path_dedup_hits_total counter
+fast_path_dedup_hits_total %d
 `,
 		m.cursor.Load(), syncDelay,
 		m.walPending.Load(), m.walBytes.Load(),
@@ -189,7 +265,10 @@ sync_e2e_delay_seconds %d
 		m.retry.Load(), m.dlqTotal.Load(), m.heartbeat.Load(), m.pollSkip.Load(),
 		m.recvTotal.Load(), m.writeOk.Load(), m.writeFail.Load(),
 		m.inflight.Load(), m.dupTotal.Load(),
-		m.skipPoint.Load(), m.relayDLQ.Load(), m.e2eDelay())
+		m.skipPoint.Load(), m.relayDLQ.Load(), m.e2eDelay(),
+		m.fpState.Load(), m.fpBatch.Load(), m.fpPoints.Load(), m.fpSigOnly.Load(),
+		m.fpDropBig.Load(), m.fpDropPrec.Load(), m.fpDropBP.Load(),
+		m.fpLineSkip.Load(), m.fpDedupHit.Load())
 	// 文档指标（《死信隔离与反压机制逻辑》）
 	out += fmt.Sprintf(`# HELP influx_sync_wal_disk_usage_ratio WAL 挂载盘占用率
 # TYPE influx_sync_wal_disk_usage_ratio gauge

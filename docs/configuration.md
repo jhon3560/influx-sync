@@ -25,11 +25,17 @@ sync:
   poller_parallel: 4    # 并行查询/组帧 worker 数（0/1=串行）
   signal_listen: ":18098"  # 订阅信号监听（源库 SUBSCRIPTION 推送目标）；空=纯轮询
   signal_min_interval: 200ms  # 信号最小查询间隔（V1.4：忙时信号延迟触发而非丢弃）
+  fast_path:            # A4 快路径（V1.5）：订阅推送直接透传，端到端延迟降到 <1s
+    listen: ":18097"    #   推送监听地址；空=禁用（退化为纯轮询）
+    mode: auto          #   off=仅信号（=旧 signal_listen 行为）/ auto=游标追平自动启用（默认）/ on=强制转发
+    activate_age: 5s    #   auto：cursor 年龄 ≤ 此值启用透传（默认 watermark+3s）
+    deactivate_age: 30s #   auto：年龄 > 此值退回仅信号（迟滞防抖）
+    dedup_window: 15s   #   去重集保留窗口（默认 watermark+5s；驱逐/重启只会造成重复转发，不丢）
   backfill: 0s          # 首次启动回填时长（游标=now-watermark-backfill）
   tag_columns: []       # 显式 tag 列（空=自动 SHOW TAG KEYS 发现）。
                         # 推荐显式配置：完全绕开 schema 降级期类型漂移风险（N8）；
                         # 显式配置时不再查询 SHOW TAG KEYS（仍查 SHOW FIELD KEYS 取类型）
-  measurements: []      # 同步的 measurement（空=全部 /.*/）
+  measurements: []      # 同步的 measurement（空=全部 /.*/）；快路径逐行按此过滤
 
 wal:
   path: /opt/influx-sync/data/wal-174   # WAL 目录（必填；勿与其他实例共用）

@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -263,4 +265,154 @@ func TestEndToEndRestartRecovery(t *testing.T) {
 
 func encodeData(seq uint64, payload []byte) ([]byte, error) {
 	return protocol.EncodeData(seq, payload)
+}
+
+// TestEndToEndFastPath A4 e2e：快路径透传 + Poller 去重抑制二次转发（零丢失零重复）。
+//
+// 关键断言：推送的每个点在目标库**恰好出现一次**——快路径转发的副本 + 轮询
+// 窗口的孪生副本被去重集抑制。源假库的查询网格锚定在 epoch 的 100ms 整数倍上，
+// 推送 ts 取同网格点，保证轮询窗口必然返回孪生行（去重路径确定性触发）。
+func TestEndToEndFastPath(t *testing.T) {
+	const step = int64(100_000_000) // 100ms 网格
+	// 源假库：网格锚定 epoch 整数倍（区别于共享 fakeSource 的 cursor 锚定）
+	var seq atomic.Int64
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/query" {
+			http.NotFound(w, r)
+			return
+		}
+		q := r.URL.Query().Get("q")
+		// schema 元查询：plant=tag、value=float——保证轮询路径与快路径构造相同的 series 键
+		if strings.HasPrefix(q, "SHOW TAG KEYS") {
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"telemetry","columns":["tagKey"],"values":[["plant"]]}]}]}`)
+			return
+		}
+		if strings.HasPrefix(q, "SHOW FIELD KEYS") {
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"telemetry","columns":["fieldKey","fieldType"],"values":[["value","float"]]}]}]}`)
+			return
+		}
+		var start, end int64
+		if _, err := fmt.Sscanf(q, "SELECT * FROM /.*/ WHERE time >= %dns AND time < %dns LIMIT %d", &start, &end); err != nil {
+			fmt.Sscanf(q, "SELECT * FROM \"telemetry\" WHERE time >= %dns AND time < %dns LIMIT %d", &start, &end)
+		}
+		var rows []string
+		first := (start + step - 1) / step * step
+		for ts := first; ts < end; ts += step {
+			rows = append(rows, fmt.Sprintf(`[%d,"A01",%d]`, ts, seq.Add(1)))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"results":[{"series":[{"name":"telemetry","columns":["time","plant","value"],"values":[%s]}]}]}`, strings.Join(rows, ","))
+	}))
+	t.Cleanup(src.Close)
+
+	// 目标假库：统计每个 ts 出现的次数（按行尾时间戳）
+	var mu sync.Mutex
+	tsCount := map[int64]int{}
+	var totalLines atomic.Int64
+	tgt := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/write" {
+			http.NotFound(w, r)
+			return
+		}
+		buf := make([]byte, 1<<20)
+		n, _ := r.Body.Read(buf)
+		body := string(buf[:n])
+		mu.Lock()
+		for _, line := range strings.Split(strings.TrimSpace(body), "\n") {
+			if line == "" {
+				continue
+			}
+			i := strings.LastIndexByte(line, ' ')
+			if i < 0 {
+				continue
+			}
+			if ts, err := strconv.ParseInt(strings.TrimSpace(line[i+1:]), 10, 64); err == nil {
+				tsCount[ts]++
+				totalLines.Add(1)
+			}
+		}
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(tgt.Close)
+
+	_, addr := startReceiverSrv(t, tgt.URL, filepath.Join(t.TempDir(), "last_seq"))
+	walDir := filepath.Join(t.TempDir(), "wal")
+	w, err := wal.Open(walDir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	ic, err := influx.NewClient(influx.Config{URL: src.URL, Database: "power", Timeout: "3s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := monitor.New()
+	poller := sender.NewPoller(ic, w, metrics, testLogger(t), sender.PollerConfig{
+		Interval: 50 * time.Millisecond, Window: 500 * time.Millisecond, Watermark: 300 * time.Millisecond,
+		BatchPoints: 100,
+	})
+	// A4：mode=on 强制转发（状态机由单测覆盖）
+	fp := sender.NewFastPath(w, metrics, testLogger(t), sender.FastPathConfig{Mode: sender.FastPathOn}, poller.Notify, nil)
+	poller.SetFastPath(fp)
+
+	client := transport.NewClient(transport.ClientConfig{Addr: addr, Timeout: 2 * time.Second})
+	sl := sender.NewSender(w, client, metrics, testLogger(t), sender.SenderConfig{
+		MaxRetry: 5, BackoffBase: 20 * time.Millisecond, BackoffMax: 200 * time.Millisecond,
+		IdleSleep: 5 * time.Millisecond, HeartbeatInterval: time.Hour,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// 游标初始化到近实时（对齐 cmd/sender 首次启动行为：now - watermark - 余量）
+	if err := w.SetCursor(time.Now().Add(-time.Second).UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	go poller.Run(ctx)
+	go sl.Run(ctx)
+
+	// 推送 3 个点：网格对齐且位于 (cursor, now-watermark) 区间内——轮询窗口必然
+	// 返回孪生行（去重路径确定性触发）。base-3..-1 步 ≈ now-400ms..now-200ms。
+	now := time.Now().UnixNano()
+	base := now / step * step
+	pushed := []int64{base - 3*step, base - 2*step, base - step}
+	var body strings.Builder
+	for _, ts := range pushed {
+		fmt.Fprintf(&body, "telemetry,plant=A01 value=9 %d\n", ts)
+	}
+	rec := httptest.NewRecorder()
+	fp.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body.String())))
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("fast path code=%d", rec.Code)
+	}
+	if metrics.FastPathPoints() != 3 {
+		t.Fatalf("fast path points=%d", metrics.FastPathPoints())
+	}
+
+	// 等待：WAL 清空 + 去重命中 3（轮询窗口已覆盖推送点）
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if metrics.FastPathDedupHit() >= 3 && w.PendingCount() == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if metrics.FastPathDedupHit() != 3 {
+		t.Fatalf("dedup hits=%d, want 3 (poller must suppress twin rows)", metrics.FastPathDedupHit())
+	}
+	if w.PendingCount() != 0 {
+		t.Fatalf("wal pending=%d", w.PendingCount())
+	}
+	// 零重复：每个推送点在目标库恰好出现一次（快路径副本；轮询孪生被去重）
+	mu.Lock()
+	for _, ts := range pushed {
+		if got := tsCount[ts]; got != 1 {
+			mu.Unlock()
+			t.Fatalf("pushed ts=%d appeared %d times in target, want exactly 1", ts, got)
+		}
+	}
+	mu.Unlock()
+	// 零丢失：背景轮询数据持续落库
+	if totalLines.Load() < int64(len(pushed)) {
+		t.Fatalf("total lines=%d", totalLines.Load())
+	}
 }

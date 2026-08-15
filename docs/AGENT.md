@@ -7,7 +7,7 @@
 | 项 | 值 |
 |---|---|
 | 源码 | WSL `~/influx-sync-src`（git 管理） |
-| 当前版本 | V1.4.3（tag v1.4.3，分支 feature/audit-fixes） |
+| 当前版本 | V1.5.0（tag v1.5.0，A4 订阅 fast-path 透传；V1.4.3 分支为 audit-fixes 收尾） |
 | 版本体系 | v1.0(master) → v1.1(feature/parallel) → v1.2~v1.2.3(feature/signal-trigger) → v1.3+中继 → v1.3.1(审计修复) → v1.4.0(性能审计修复) → v1.4.1(滑窗缺陷复审 N1-N5) → v1.4.2(复审 N6-N8) → v1.4.3(收尾加固)；每版本打 tag，二进制保留 .bak |
 | 构建 | `CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o bin/sender ./cmd/sender`（麒麟 V10 glibc 2.28 必须静态） |
 | 发布流程 | **先 commit+tag，确认工作树干净后再构建**（在仓库外目录构建再拷回 bin/），保证 `go version -m` 的 vcs.revision=tag 且 vcs.modified=false；发布包需含 SHA256SUMS |
@@ -65,7 +65,11 @@
 1. 174/175 建订阅：`CREATE SUBSCRIPTION hx_sub ON HXScada.autogen DESTINATIONS ALL
    'http://192.0.2.176:18099'`（175 用 18199）——hx_migrate 用
 2. influx-sync 信号订阅（如需启用）：推送到 103 的 18098
-3. 确认源库表名（channel table_name 当前 hisdb 是占位值）
+3. **V1.5 A4 fast-path**：每库仅允许 1 个 subscription——需把 fast-path 地址
+   （103 的 18097）追加为同一订阅的第二个 DESTINATION（DROP+CREATE，几秒推送
+   中断，无数据影响）；建议 `[subscriber] flush-interval=100~200ms`。详见
+   docs/a4-fast-path.md §6/§9
+4. 确认源库表名（channel table_name 当前 hisdb 是占位值）
 
 ## 4. 关键决策记录
 

@@ -3,7 +3,6 @@ package sender
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"sort"
@@ -70,7 +69,12 @@ type Poller struct {
 	signalTimer     *time.Timer   // 信号延迟触发定时器（MinSignalInterval 护栏）
 	lastPoll        atomic.Int64  // 上次查询时间（unixnano，原子防竞态）
 	wakeupScheduled atomic.Bool   // watermark 解锁自唤醒定时器是否已安排（原子，防竞态）
+
+	fastPath *FastPath // A4 快路径（nil=未启用）；查询归并后过滤已转发点
 }
+
+// SetFastPath 注入快路径转发器（A4；nil 时轮询行为与旧版完全一致）。
+func (p *Poller) SetFastPath(fp *FastPath) { p.fastPath = fp }
 
 // NewPoller 创建轮询器。
 func NewPoller(client *influx.Client, w *wal.WAL, metrics *monitor.Metrics, logger *zap.Logger, cfg PollerConfig) *Poller {
@@ -221,8 +225,14 @@ func (p *Poller) Run(ctx context.Context) {
 
 // walDiskUsageRatio 返回 WAL 挂载盘占用率（0~1）；统计失败返回 0（不干预）。
 func (p *Poller) walDiskUsageRatio() float64 {
+	return WalDiskUsageRatio(p.wal.Dir())
+}
+
+// WalDiskUsageRatio 返回指定目录挂载盘占用率（0~1）；统计失败返回 0。
+// Poller 反压与 FastPath 反压门共用。
+func WalDiskUsageRatio(dir string) float64 {
 	var st syscall.Statfs_t
-	if err := syscall.Statfs(p.wal.Dir(), &st); err != nil {
+	if err := syscall.Statfs(dir, &st); err != nil {
 		return 0
 	}
 	total := st.Blocks * uint64(st.Bsize)
@@ -255,6 +265,17 @@ func (p *Poller) pollOnce(ctx context.Context) (blocked bool) {
 	if err != nil {
 		p.logger.Warn("query failed, keep cursor", zap.Error(err))
 		return false // 保持游标，下轮重试
+	}
+	// A4：更新快路径状态机/去重集驱逐基准（每轮，无论是否过滤）
+	if p.fastPath != nil {
+		p.fastPath.SetCursor(cursor)
+		// 过滤已由快路径转发的点（登记在 WAL 成功后 ⟹ 跳过即已转发，零丢失）
+		if before := len(points); before > 0 {
+			points = p.fastPath.Filter(points)
+			if after := len(points); after < before {
+				p.logger.Debug("fast path dedup filtered", zap.Int("skipped", before-after), zap.Int("kept", after))
+			}
+		}
 	}
 	p.logger.Info("poll window", zap.Int64("start", cursor), zap.Int64("end", end), zap.Int("points", len(points)))
 
@@ -445,7 +466,6 @@ func (p *Poller) appendBatch(points []model.Point, batch int) error {
 		batch = 1
 	}
 	nFrames := (len(points) + batch - 1) / batch
-	baseSeq := p.wal.NextSeq()
 
 	type framed struct {
 		idx  int
@@ -476,7 +496,8 @@ func (p *Poller) appendBatch(points []model.Point, batch int) error {
 					frames <- framed{idx: i, err: err}
 					continue
 				}
-				fb, err := protocol.Encode(protocol.TypeData, baseSeq+uint64(i), payload)
+				// seq 占位 0：真实 seq 由 WAL.AppendBatch 锁内分配（并发追加安全）
+				fb, err := protocol.Encode(protocol.TypeData, 0, payload)
 				if err != nil {
 					frames <- framed{idx: i, err: err}
 					continue
@@ -504,7 +525,7 @@ func (p *Poller) appendBatch(points []model.Point, batch int) error {
 			if isFrameTooLarge(f.err) && batch > 1 {
 				// 先落盘 i 之前的帧，再递归拆批失败段
 				if len(good) > 0 {
-					if err := p.appendGood(baseSeq, good); err != nil {
+					if err := p.appendGood(good); err != nil {
 						return err
 					}
 					good = nil
@@ -519,8 +540,6 @@ func (p *Poller) appendBatch(points []model.Point, batch int) error {
 				if err := p.appendBatch(points[start:endPt], batch/2); err != nil {
 					return err
 				}
-				// 递归返回后继续处理后续帧（seq 从 NextSeq 续）
-				baseSeq = p.wal.NextSeq()
 				continue
 			}
 			if isFrameTooLarge(f.err) {
@@ -535,18 +554,15 @@ func (p *Poller) appendBatch(points []model.Point, batch int) error {
 		good = append(good, f.data)
 	}
 	if len(good) > 0 {
-		return p.appendGood(baseSeq, good)
+		return p.appendGood(good)
 	}
 	return nil
 }
 
-// appendGood 落盘连续帧段（group commit）：按 NextSeq 重写头部 seq 后一次 fsync。
-func (p *Poller) appendGood(baseSeq uint64, good [][]byte) error {
-	for j := range good {
-		// 编码阶段 seq 为 baseSeq+idx；跳帧后可能错位，按落盘序重写
-		binary.BigEndian.PutUint64(good[j][4:12], baseSeq+uint64(j))
-	}
-	return p.wal.AppendBatch(protocol.TypeData, baseSeq, good)
+// appendGood 落盘连续帧段（group commit）：seq 由 WAL.AppendBatch 内部分配（并发追加安全）。
+func (p *Poller) appendGood(good [][]byte) error {
+	_, err := p.wal.AppendBatch(protocol.TypeData, good)
+	return err
 }
 
 // isFrameTooLarge 判断编码失败是否因帧超限（可拆批恢复）。

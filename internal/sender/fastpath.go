@@ -1,0 +1,327 @@
+// Package sender A4 订阅 fast-path：接收源库 SUBSCRIPTION 推送的原始 Line Protocol
+// 批次，直接透传进同一 WAL/seq 流，把端到端延迟从 watermark+处理(~4.2s) 降到
+// flush 间隔+传输(~0.1-1s)。轮询路径（Poller）保持为零丢失正确性基座：快路径的
+// 一切退化方向（订阅丢包/解析跳过/反压丢批/去重集驱逐）都只造成"重复转发"或
+// "退回轮询"，不存在丢数据方向。
+package sender
+
+import (
+	"bytes"
+	"io"
+	"net/http"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"go.uber.org/zap"
+
+	"influx-sync/internal/model"
+	"influx-sync/internal/monitor"
+	"influx-sync/internal/protocol"
+	"influx-sync/internal/wal"
+)
+
+// FastPathMode 快路径模式：off=仅信号（=V1.4 及以前行为）/ auto=游标追平自动启用 / on=强制转发。
+type FastPathMode string
+
+const (
+	FastPathOff  FastPathMode = "off"
+	FastPathAuto FastPathMode = "auto"
+	FastPathOn   FastPathMode = "on"
+)
+
+// FastPathConfig 快路径配置。
+type FastPathConfig struct {
+	Mode          FastPathMode  // off/auto/on，默认 auto
+	ActivateAge   time.Duration // auto 模式启用阈值：cursor 年龄 ≤ 此值才转发（默认 watermark+3s）
+	DeactivateAge time.Duration // auto 模式退避阈值：年龄 > 此值退回仅信号（迟滞，默认 30s）
+	DedupWindow   time.Duration // 去重集保留窗口（默认 watermark+5s）
+	Measurements  []string      // 同步 measurement 白名单（与轮询路径一致；空=全部）
+	MaxBatchBytes int           // 单批上限（默认 MaxDecompressedLen）
+}
+
+// ns 精度守卫：ts 必须落在 [1e15, 5e18)（1970-09 至 2128）。ns/µs 数值域重叠
+// （1.75e15 既是 ns-1970 也是 µs-2025）无法可靠判别，非 ns 批次跳过由 Poller 兜底
+// （Poller 经 epoch=ns 查询拿到正确精度）。
+const (
+	minNsTimestamp = int64(1e15)
+	maxNsTimestamp = int64(5e18)
+)
+
+// fastDedup 快路径→轮询路径的转发去重集（A4）。
+//
+// 结构：秒级分区 + series 紧凑 ID。条目 = id<<30 | (ts % 1e9)，精确键零碰撞。
+// 登记时机：仅在 WAL AppendBatch **成功之后**——保证"被 Poller 跳过 ⟹ 已实际
+// 转发"（零丢失证明的核心）。驱逐：分区秒 < cursor 即删（Poller 永不回查）。
+// 驱逐/重启丢失条目只会造成重复转发（目标库幂等覆盖），安全方向唯一。
+type fastDedup struct {
+	mu        sync.Mutex
+	series    map[string]uint64
+	nextID    uint64
+	parts     map[int64]map[uint64]struct{} // 秒 -> packed(id, offset)
+	retention time.Duration
+	cursorNs  atomic.Int64 // 最近一次 Poller 游标（驱逐基准）
+}
+
+func newFastDedup(retention time.Duration) *fastDedup {
+	if retention <= 0 {
+		retention = 15 * time.Second
+	}
+	return &fastDedup{
+		series:    make(map[string]uint64),
+		parts:     make(map[int64]map[uint64]struct{}),
+		retention: retention,
+	}
+}
+
+// SetCursor 更新驱逐基准（Poller 每轮 poll 调用，值为本轮查询窗口起点）。
+func (d *fastDedup) SetCursor(cursorNs int64) {
+	prev := d.cursorNs.Swap(cursorNs)
+	if prev == cursorNs {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	cut := cursorNs/int64(time.Second) - int64(d.retention/time.Second)
+	for sec := range d.parts {
+		if sec < cut {
+			delete(d.parts, sec)
+		}
+	}
+}
+
+// Add 登记一个已转发点（调用方保证 WAL 已成功落盘）。
+func (d *fastDedup) Add(seriesKey string, ts int64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	id, ok := d.series[seriesKey]
+	if !ok {
+		if d.nextID >= 1<<34 {
+			return // series 数超设计上限：拒绝登记（去重退化为重复转发，安全）
+		}
+		id = d.nextID
+		d.nextID++
+		d.series[seriesKey] = id
+	}
+	sec := ts / int64(time.Second)
+	part := d.parts[sec]
+	if part == nil {
+		part = make(map[uint64]struct{})
+		d.parts[sec] = part
+	}
+	part[id<<30|uint64(ts-sec*int64(time.Second))] = struct{}{}
+}
+
+// Contains 查询点是否已由快路径转发。
+func (d *fastDedup) Contains(seriesKey string, ts int64) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	id, ok := d.series[seriesKey]
+	if !ok {
+		return false
+	}
+	sec := ts / int64(time.Second)
+	part := d.parts[sec]
+	if part == nil {
+		return false
+	}
+	_, hit := part[id<<30|uint64(ts-sec*int64(time.Second))]
+	return hit
+}
+
+// Len 返回集内条目数（指标用）。
+func (d *fastDedup) Len() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	n := 0
+	for _, p := range d.parts {
+		n += len(p)
+	}
+	return n
+}
+
+// FastPath A4 快路径转发器（HTTP handler）。线程安全（并发推送）。
+type FastPath struct {
+	wal      *wal.WAL
+	dedup    *fastDedup
+	cfg      FastPathConfig
+	metrics  *monitor.Metrics
+	logger   *zap.Logger
+	notify   func()         // Poller 信号回调（批处理成功后唤醒 Poller）
+	diskGate func() float64 // WAL 盘占用率（反压门）
+
+	active atomic.Bool // ACTIVE/WAITING 状态（mode=auto 由 cursor 年龄驱动；on=恒真）
+}
+
+// NewFastPath 创建快路径转发器。
+func NewFastPath(w *wal.WAL, metrics *monitor.Metrics, logger *zap.Logger, cfg FastPathConfig, notify func(), diskGate func() float64) *FastPath {
+	if cfg.Mode == "" {
+		cfg.Mode = FastPathAuto
+	}
+	if cfg.ActivateAge <= 0 {
+		cfg.ActivateAge = 5 * time.Second
+	}
+	if cfg.DeactivateAge <= 0 {
+		cfg.DeactivateAge = 30 * time.Second
+	}
+	if cfg.MaxBatchBytes <= 0 {
+		cfg.MaxBatchBytes = protocol.MaxDecompressedLen
+	}
+	fp := &FastPath{
+		wal:      w,
+		dedup:    newFastDedup(cfg.DedupWindow),
+		cfg:      cfg,
+		metrics:  metrics,
+		logger:   logger,
+		notify:   notify,
+		diskGate: diskGate,
+	}
+	if cfg.Mode == FastPathOn {
+		fp.active.Store(true)
+	}
+	return fp
+}
+
+// Active 返回当前是否处于转发状态（指标/测试用）。
+func (f *FastPath) Active() bool { return f.active.Load() }
+
+// Enabled 配置是否启用（listen 已配置）。
+func (f *FastPath) Enabled() bool { return f.cfg.Mode != FastPathOff }
+
+// SetCursor 由 Poller 每轮调用：更新去重集驱逐基准 + auto 模式状态机（迟滞防抖）。
+func (f *FastPath) SetCursor(cursorNs int64) {
+	f.dedup.SetCursor(cursorNs)
+	if f.cfg.Mode != FastPathAuto {
+		return
+	}
+	age := time.Now().UnixNano() - cursorNs
+	switch {
+	case !f.active.Load() && age <= int64(f.cfg.ActivateAge):
+		f.active.Store(true)
+		f.metrics.SetFastPathState(2)
+		f.logger.Info("fast path activated (wal cursor caught up)",
+			zap.Int64("cursor", cursorNs), zap.Duration("age", time.Duration(age)))
+	case f.active.Load() && age > int64(f.cfg.DeactivateAge):
+		f.active.Store(false)
+		f.metrics.SetFastPathState(1)
+		f.logger.Warn("fast path deactivated (wal cursor lagging), falling back to polling only",
+			zap.Int64("cursor", cursorNs), zap.Duration("age", time.Duration(age)))
+	}
+}
+
+// Filter 供 Poller 在查询归并后调用：剔除已由快路径转发的点。
+// 跳过 ⟹ 已转发（登记在 WAL 成功之后），零丢失。
+func (f *FastPath) Filter(points []model.Point) []model.Point {
+	if len(points) == 0 {
+		return points
+	}
+	out := points[:0]
+	for i := range points {
+		key := model.SeriesKey(points[i].Measurement, points[i].Tags)
+		if f.dedup.Contains(key, points[i].Timestamp) {
+			f.metrics.IncFastPathDedupHit()
+			continue
+		}
+		out = append(out, points[i])
+	}
+	return out
+}
+
+// ServeHTTP 处理一次订阅推送批次。
+func (f *FastPath) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.metrics.IncFastPathBatch()
+	if f.notify != nil {
+		f.notify() // 无论是否转发，到达即信号（复用现有合并语义）
+	}
+	if f.cfg.Mode == FastPathOff || !f.active.Load() {
+		f.metrics.IncFastPathSignalOnly()
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, int64(f.cfg.MaxBatchBytes)+1))
+	if err != nil || len(body) == 0 {
+		f.metrics.IncFastPathDroppedOversize()
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if len(body) > f.cfg.MaxBatchBytes {
+		f.metrics.IncFastPathDroppedOversize()
+		f.logger.Warn("fast path batch over size limit, skipped (polling covers)",
+			zap.Int("bytes", len(body)), zap.Int("limit", f.cfg.MaxBatchBytes))
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	// 反压门：WAL 盘占用 ≥ 黄线时丢批（Poller 兜底，延迟退化回轮询）
+	if gate := f.diskGate; gate != nil && gate() >= bpYellowTrigger {
+		f.metrics.IncFastPathDroppedBackpressure()
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	// 逐行解析过滤：坏行/非 ns 行/非目标 measurement 行跳过（Poller 兜底）
+	var out []byte
+	var keys []dedupKey
+	for _, line := range bytes.Split(body, []byte{'\n'}) {
+		if len(line) == 0 {
+			continue
+		}
+		meas, tags, ts, ok := model.ParseLine(line)
+		if !ok {
+			f.metrics.IncFastPathLineSkipped()
+			continue
+		}
+		if ts < minNsTimestamp || ts > maxNsTimestamp {
+			f.metrics.IncFastPathLineSkipped()
+			continue // 非 ns 精度：跳过，Poller 经 epoch=ns 正确处理
+		}
+		if !f.measurementAllowed(meas) {
+			f.metrics.IncFastPathLineSkipped()
+			continue
+		}
+		out = append(out, line...)
+		out = append(out, '\n')
+		keys = append(keys, dedupKey{series: model.SeriesKeyFromPairs(meas, tags), ts: ts})
+	}
+	if len(out) == 0 {
+		f.metrics.IncFastPathDroppedPrecision()
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	// 组帧（gzip 与轮询路径完全一致）→ WAL（内部分配 seq）→ 成功后登记去重
+	fb, err := protocol.Encode(protocol.TypeData, 0, out)
+	if err != nil {
+		// 压缩后超 1MB 帧限等：整批跳过（Poller 兜底）
+		f.metrics.IncFastPathDroppedOversize()
+		f.logger.Warn("fast path batch encode failed, skipped", zap.Error(err))
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if _, err := f.wal.AppendBatch(protocol.TypeData, [][]byte{fb}); err != nil {
+		f.metrics.IncFastPathDroppedBackpressure()
+		f.logger.Warn("fast path wal append failed, skipped (polling covers)", zap.Error(err))
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	for i := range keys {
+		f.dedup.Add(keys[i].series, keys[i].ts)
+	}
+	f.metrics.AddFastPathPoints(int64(len(keys)))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+type dedupKey struct {
+	series string
+	ts     int64
+}
+
+// measurementAllowed 判断 measurement 是否在同步白名单内（空=全部）。
+func (f *FastPath) measurementAllowed(meas string) bool {
+	if len(f.cfg.Measurements) == 0 {
+		return true
+	}
+	for _, m := range f.cfg.Measurements {
+		if m == meas {
+			return true
+		}
+	}
+	return false
+}

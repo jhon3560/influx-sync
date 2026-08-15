@@ -21,10 +21,11 @@
 
 ```
 [I 区] 源 InfluxDB(174/175)
-        │  轮询查询 + 订阅信号（事件驱动）
+        │  轮询查询 + 订阅推送（信号 + V1.5 fast-path 透传）
         ▼
-[sender] ──┬─ Poller：窗口轮询 [cursor, now-watermark) → 并行查询/组帧 → WAL → 推进游标
+[sender] ──┬─ Poller：窗口轮询 [cursor, now-watermark) → 并行查询/组帧 → 快路径去重过滤 → WAL → 推进游标
            ├─ SignalListener：订阅推送信号 → Notify（pending-flag+延迟触发，不丢弃）
+           ├─ FastPath(V1.5)：订阅推送批解析/过滤 → 同一 WAL（gzip 管线）；游标追平自动启用（三态+迟滞）
            └─ Sender：WAL.Peek → 停等发送（帧 → 单字节 ACK）→ Commit / 重试 / DLQ
         │  ISFP over TCP（经隔离装置映射）
         ▼
@@ -36,15 +37,19 @@
 [III 区] 目标 InfluxDB(HXScada)
 ```
 
+> A4 快路径说明：历史同步由 Poller 全权负责（订阅只推送新写入）；快路径仅在游标追平
+> （cursor 年龄 ≤ activate_age）后透传，与轮询窗口重叠区由秒级分区去重集抑制重复转发；
+> 快路径只加速、不改变正确性基座（详见 docs/a4-fast-path.md）。
+
 ## 3. 模块划分（包职责）
 
 | 包 | 职责 | 关键点 |
 |---|---|---|
 | internal/protocol | ISFP 帧编解码 | 20B Header + gzip Payload + CRC32；解压上限独立校验 |
-| internal/model | Point / Line Protocol 序列化 | 缓存键序（schema 级一次排序）+ 转义循环 + strconv（60x CPU） |
+| internal/model | Point / Line Protocol 序列化与解析 | 缓存键序（schema 级一次排序）+ 转义循环 + strconv（60x CPU）；LP 行解析（V1.5 fast-path 用） |
 | internal/influx | InfluxDB 1.x HTTP 客户端 | 查询/WriteRaw、schema 自适应（single-flight+降级复用）、动态超时 |
 | internal/wal | 分段 WAL | group commit、checkpoint 节流、撕裂尾截断恢复、中段坏帧跳帧重同步 |
-| internal/sender | Poller / Sender / SignalListener | 反压状态机、边界去重、拆批/跳点、滑窗（实验）、WAL 通知唤醒 |
+| internal/sender | Poller / Sender / SignalListener / FastPath | 反压状态机、边界去重、拆批/跳点、滑窗（实验）、WAL 通知唤醒、快路径透传+去重集（V1.5） |
 | internal/receiver | 帧处理 | last_seq 连续前缀 + 缺口闭合、毒丸 DLQ、中继、e2e 延迟指标 |
 | internal/transport | TCP 客户端/服务端 | 停等客户端；服务端流水线（并发 handler + 按序 ACK + 在途窗口） |
 | internal/monitor | Prometheus 指标 | 全 atomic，无锁 |

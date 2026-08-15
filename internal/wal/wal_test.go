@@ -536,20 +536,37 @@ func TestAppendBatchGroupCommit(t *testing.T) {
 	}
 	var frames [][]byte
 	for i := 0; i < 10; i++ {
-		fb, err := protocol.Encode(protocol.TypeData, uint64(i+1), []byte(fmt.Sprintf("m value=%d %d", i, i)))
+		fb, err := protocol.Encode(protocol.TypeData, 0, []byte(fmt.Sprintf("m value=%d %d", i, i))) // 占位 seq=0
 		if err != nil {
 			t.Fatal(err)
 		}
 		frames = append(frames, fb)
 	}
-	if err := w.AppendBatch(protocol.TypeData, 1, frames); err != nil {
+	seqs, err := w.AppendBatch(protocol.TypeData, frames)
+	if err != nil {
 		t.Fatalf("AppendBatch: %v", err)
+	}
+	if len(seqs) != 10 {
+		t.Fatalf("seqs len=%d", len(seqs))
+	}
+	for i := 1; i < len(seqs); i++ {
+		if seqs[i] != seqs[i-1]+1 {
+			t.Fatalf("seqs not consecutive: %v", seqs)
+		}
+	}
+	if seqs[0] != 1 {
+		t.Fatalf("first seq=%d, want 1 (fresh WAL starts at 1, N7)", seqs[0])
 	}
 	if w.PendingCount() != 10 {
 		t.Fatalf("pending=%d", w.PendingCount())
 	}
 	if w.NextSeq() != 11 {
 		t.Fatalf("next_seq=%d", w.NextSeq())
+	}
+	// 帧头 seq 已被重写为分配值
+	fd0, _, err := w.Peek()
+	if err != nil || fd0 != seqs[0] {
+		t.Fatalf("peek seq=%d err=%v, want %d", fd0, err, seqs[0])
 	}
 	w.SetCursor(500)
 	w.Close()
@@ -569,9 +586,12 @@ func TestAppendBatchGroupCommit(t *testing.T) {
 	if fds[0].Seq != 1 || fds[2].Seq != 3 {
 		t.Fatalf("peek seqs=%d..%d", fds[0].Seq, fds[2].Seq)
 	}
-	// 乱序 seq 必须拒绝（顺序铁律）
-	if err := w2.AppendBatch(protocol.TypeData, 5, frames[:1]); err == nil {
-		t.Fatal("out-of-order batch must fail")
+	// 追加的第二批 seq 应从 11 连续续上（内部 seq 分配不受外部影响）
+	if _, err := w2.AppendBatch(protocol.TypeData, frames[:1]); err != nil {
+		t.Fatalf("second batch append: %v", err)
+	}
+	if w2.NextSeq() != 12 {
+		t.Fatalf("next_seq=%d, want 12", w2.NextSeq())
 	}
 }
 
