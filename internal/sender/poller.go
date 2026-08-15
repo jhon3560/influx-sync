@@ -33,6 +33,7 @@ type PollerConfig struct {
 	MinSignalInterval time.Duration // 订阅信号最小查询间隔（防高频信号打满 Poller），默认 200ms
 	TagColumns        []string      // 显式 tag 列（空=自动发现）
 	Measurements      []string      // 要同步的 measurement 列表（空=全部）
+	Compression       uint8         // 数据帧类型（protocol.TypeData=gzip / TypeDataZstd=zstd），默认 zstd
 }
 
 // 反压三级水位（《死信隔离与反压机制逻辑》）：
@@ -101,6 +102,9 @@ func NewPoller(client *influx.Client, w *wal.WAL, metrics *monitor.Metrics, logg
 	}
 	if cfg.MinSignalInterval <= 0 {
 		cfg.MinSignalInterval = 200 * time.Millisecond
+	}
+	if cfg.Compression == 0 {
+		cfg.Compression = protocol.TypeDataZstd
 	}
 	return &Poller{
 		client:      client,
@@ -497,7 +501,11 @@ func (p *Poller) appendBatch(points []model.Point, batch int) error {
 					continue
 				}
 				// seq 占位 0：真实 seq 由 WAL.AppendBatch 锁内分配（并发追加安全）
-				fb, err := protocol.Encode(protocol.TypeData, 0, payload)
+				typ := p.cfg.Compression
+				if typ == 0 {
+					typ = protocol.TypeDataZstd // 直接构造（测试）时的兜底默认
+				}
+				fb, err := protocol.Encode(typ, 0, payload)
 				if err != nil {
 					frames <- framed{idx: i, err: err}
 					continue

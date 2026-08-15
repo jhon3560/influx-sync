@@ -38,6 +38,7 @@ type FastPathConfig struct {
 	DedupWindow   time.Duration // 去重集保留窗口（默认 watermark+5s）
 	Measurements  []string      // 同步 measurement 白名单（与轮询路径一致；空=全部）
 	MaxBatchBytes int           // 单批上限（默认 MaxDecompressedLen）
+	Compression   uint8         // 数据帧类型（protocol.TypeData=gzip / TypeDataZstd=zstd），默认 zstd
 }
 
 // ns 精度守卫：ts 必须落在 [1e15, 5e18)（1970-09 至 2128）。ns/µs 数值域重叠
@@ -167,6 +168,9 @@ func NewFastPath(w *wal.WAL, metrics *monitor.Metrics, logger *zap.Logger, cfg F
 	if cfg.MaxBatchBytes <= 0 {
 		cfg.MaxBatchBytes = protocol.MaxDecompressedLen
 	}
+	if cfg.Compression == 0 {
+		cfg.Compression = protocol.TypeDataZstd
+	}
 	fp := &FastPath{
 		wal:      w,
 		dedup:    newFastDedup(cfg.DedupWindow),
@@ -286,8 +290,8 @@ func (f *FastPath) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	// 组帧（gzip 与轮询路径完全一致）→ WAL（内部分配 seq）→ 成功后登记去重
-	fb, err := protocol.Encode(protocol.TypeData, 0, out)
+	// 组帧（压缩与轮询路径一致：gzip/zstd 按配置）→ WAL（内部分配 seq）→ 成功后登记去重
+	fb, err := protocol.Encode(f.cfg.Compression, 0, out)
 	if err != nil {
 		// 压缩后超 1MB 帧限等：整批跳过（Poller 兜底）
 		f.metrics.IncFastPathDroppedOversize()

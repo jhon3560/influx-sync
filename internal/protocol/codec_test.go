@@ -5,6 +5,8 @@ import (
 	"compress/gzip"
 	"crypto/rand"
 	"hash/crc32"
+
+	"github.com/klauspost/compress/zstd"
 	"strings"
 	"testing"
 )
@@ -140,5 +142,65 @@ func TestDecompressTooLargeRejected(t *testing.T) {
 	}
 	if _, err := f.Decompress(); err == nil {
 		t.Fatal("expected decompress too-large error, got nil (silent truncation)")
+	}
+}
+
+func TestEncodeDecodeZstd(t *testing.T) {
+	payload := []byte("telemetry,plant=A001,point=P0001 value=1.5 1720000000000000000\n")
+	for i := 0; i < 100; i++ {
+		payload = append(payload, []byte("telemetry,plant=A001,point=P0002 value=2 1720000000000000001\n")...)
+	}
+	fb, err := EncodeDataZstd(7, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := Decode(fb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !f.IsDataZstd() || f.Seq != 7 {
+		t.Fatalf("type=%x seq=%d", f.Type, f.Seq)
+	}
+	out, err := f.Decompress()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != string(payload) {
+		t.Fatal("zstd roundtrip payload mismatch")
+	}
+	// 与 gzip 帧同 payload 解压结果一致
+	fbg, _ := EncodeData(7, payload)
+	fg, _ := Decode(fbg)
+	outg, err := fg.Decompress()
+	if err != nil || string(outg) != string(payload) {
+		t.Fatal("gzip roundtrip mismatch")
+	}
+	// zstd 压缩率不劣于 gzip（同数据对比；若劣化说明选型有误）
+	if len(fb) > len(fbg) {
+		t.Fatalf("zstd frame %d > gzip frame %d", len(fb), len(fbg))
+	}
+}
+
+func TestEncodeUnsupportedType(t *testing.T) {
+	if _, err := Encode(TypeControl, 1, []byte("x")); err == nil {
+		t.Fatal("unsupported type must fail")
+	}
+	if _, err := Encode(TypeError, 1, []byte("x")); err == nil {
+		t.Fatal("unsupported type must fail")
+	}
+}
+
+func TestDecompressZstdBombGuard(t *testing.T) {
+	// 构造小压缩帧解压超过 16MB 上限的 zstd 流（全零块）
+	enc, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedFastest))
+	big := make([]byte, MaxDecompressedLen+1024)
+	compressed := enc.EncodeAll(big, nil)
+	fb := encodeRaw(TypeDataZstd, 1, compressed, crc32.ChecksumIEEE(compressed))
+	f, err := Decode(fb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Decompress(); err == nil {
+		t.Fatal("zstd bomb over limit must fail")
 	}
 }

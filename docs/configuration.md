@@ -45,6 +45,8 @@ tcp:
   addr: 192.0.2.131:28101  # receiver 地址（必填；经隔离装置映射的虚地址）
   timeout: 10s          # 读写超时
   dial_timeout: 10s     # 连接超时
+  compression: zstd     # V1.6 帧压缩算法：zstd（默认，更快+压缩率更高）/ gzip（兼容旧接收端）
+                        # 注意：zstd 需两端同版本（同一安装包满足）；混合版本升级期设 gzip
 
 sender:
   max_retry: 10         # 连续失败告警阈值（不丢弃，见 architecture §4.3）

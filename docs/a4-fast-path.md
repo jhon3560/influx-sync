@@ -151,14 +151,21 @@ CREATE SUBSCRIPTION hx_sub ON HXScada.autogen DESTINATIONS ALL
 
 ## 10. 带宽与压缩分析（FAQ）
 
-**快路径不牺牲压缩**：推送批次在 sender 侧同样经过 `protocol.Encode`（gzip BestSpeed）
-编码后才进入 WAL/隔离链路，与轮询路径压缩管线完全一致（~19x）。
+**快路径不牺牲压缩**：推送批次在 sender 侧同样经过 `protocol.Encode` 编码后才进入
+WAL/隔离链路，与轮询路径压缩管线完全一致。
+
+**V1.6 起支持 zstd**：帧类型即压缩算法标识（TypeData=0x01 gzip / TypeDataZstd=0x04
+zstd，Version 仍=1、帧布局不变），接收端按类型自动解压、中继按类型透传，零协商成本。
+`tcp.compression: zstd|gzip`（默认 zstd）——zstd(SpeedFastest) 压缩/解压显著快于
+gzip(BestSpeed)，且对 LP 类高重复文本压缩率更高（本机 5 万点/s 实测：链路 0.6Mbps
+vs gzip 2.4Mbps）。注意：zstd 帧需两端同版本（同包部署满足）；混合版本升级期
+把 `tcp.compression` 设回 gzip 即可。
 
 | 段 | 承载 | 压缩 | 影响 |
 |---|---|---|---|
 | 源库 → sender（订阅推送，I 区内部 LAN） | 原始 LP 明文 | 无 | 不占隔离链路；与现有 signal_listen 收取并丢弃的 body 相同，只是开始利用内容 |
-| sender → 隔离装置 → receiver | gzip 帧 | ~19x | 与轮询路径一致；重叠窗口由去重集抑制二次转发 |
-| 快路径组帧粒度 | 客户端写批次（如 5000 点 ≈ 400KB） | 压缩率与轮询大帧基本持平（gzip 32KB 滑窗早已稳态） | 可忽略 |
+| sender → 隔离装置 → receiver | gzip/zstd 帧 | ~19x(gzip)/更高(zstd) | 与轮询路径一致；重叠窗口由去重集抑制二次转发 |
+| 快路径组帧粒度 | 客户端写批次（如 5000 点 ≈ 400KB） | 压缩率与轮询大帧基本持平 | 可忽略 |
 
 订阅推送的源库复制开销（每个写请求推一份 body）是 SUBSCRIPTION 机制固有成本；可调大
 `[subscriber] write-buffer-size` 减少推送频次（以 flush 延迟为代价）。

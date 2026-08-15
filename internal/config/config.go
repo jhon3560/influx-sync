@@ -12,6 +12,7 @@ import (
 
 	"influx-sync/internal/influx"
 	"influx-sync/internal/monitor"
+	"influx-sync/internal/protocol"
 	"influx-sync/internal/receiver"
 	"influx-sync/internal/sender"
 	"influx-sync/internal/transport"
@@ -73,6 +74,7 @@ type SenderConfig struct {
 		Addr        string `yaml:"addr"`
 		Timeout     string `yaml:"timeout"`
 		DialTimeout string `yaml:"dial_timeout"`
+		Compression string `yaml:"compression"` // 帧压缩算法：zstd（默认，V1.6）/ gzip（兼容旧接收端）
 	} `yaml:"tcp"`
 	Sender struct {
 		MaxRetry          int    `yaml:"max_retry"`
@@ -227,7 +229,19 @@ func (c *SenderConfig) Validate() error {
 	if m := c.Sync.FastPath.Mode; m != "" && m != "off" && m != "auto" && m != "on" {
 		return fmt.Errorf("config: sync.fast_path.mode must be off/auto/on, got %q", m)
 	}
+	if cp := c.TCP.Compression; cp != "" && cp != "zstd" && cp != "gzip" {
+		return fmt.Errorf("config: tcp.compression must be zstd/gzip, got %q", cp)
+	}
 	return nil
+}
+
+// CompressionFrameType 返回数据帧类型（= 压缩算法标识）。
+// 默认 zstd（TypeDataZstd，V1.6）；配置 gzip 兼容旧接收端（混合版本升级期使用）。
+func (c *SenderConfig) CompressionFrameType() uint8 {
+	if c.TCP.Compression == "gzip" {
+		return protocol.TypeData
+	}
+	return protocol.TypeDataZstd
 }
 
 // validateDur 校验时长配置：空合法（用默认值），非空必须可解析且非负。
@@ -296,6 +310,7 @@ func (c *SenderConfig) PollerConfig() sender.PollerConfig {
 		MinSignalInterval: dur(c.Sync.SignalMinInterval, 200*time.Millisecond),
 		TagColumns:        c.Sync.TagColumns,
 		Measurements:      c.Sync.Measurements,
+		Compression:       c.CompressionFrameType(),
 	}
 }
 
@@ -313,6 +328,7 @@ func (c *SenderConfig) FastPathConfig() sender.FastPathConfig {
 		DeactivateAge: dur(c.Sync.FastPath.DeactivateAge, 30*time.Second),
 		DedupWindow:   dur(c.Sync.FastPath.DedupWindow, watermark+5*time.Second),
 		Measurements:  c.Sync.Measurements,
+		Compression:   c.CompressionFrameType(),
 	}
 }
 
