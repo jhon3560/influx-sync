@@ -31,7 +31,9 @@ sync:
     activate_age: 5s    #   auto：cursor 年龄 ≤ 此值启用透传（默认 watermark+3s）
     deactivate_age: 30s #   auto：年龄 > 此值退回仅信号（迟滞防抖）
     dedup_window: 15s   #   去重集保留窗口（默认 watermark+5s；驱逐/重启只会造成重复转发，不丢）
-  backfill: 0s          # 首次启动回填时长（游标=now-watermark-backfill）
+  backfill: all         # V1.7 回填模式：all=全量同步（默认，从库内最早数据开始）/
+                        #   0=仅实时（不碰历史）/ 30d=只补最近 30 天（支持 d 单位，1d=24h）
+                        #   改配置+重启即生效（只回拨一次游标，不清数据目录）
   tag_columns: []       # 显式 tag 列（空=自动 SHOW TAG KEYS 发现）。
                         # 推荐显式配置：完全绕开 schema 降级期类型漂移风险（N8）；
                         # 显式配置时不再查询 SHOW TAG KEYS（仍查 SHOW FIELD KEYS 取类型）
@@ -188,7 +190,34 @@ query_limit=500000、poller_parallel=4、WAL 64MB、monitor :28080。
 - 写入率低 → 按 flush-interval 触发，产生小帧（压缩率低，但绝对流量小，无碍）。
 - 例：flush-interval=200ms + buffer=1000 → 写入率 ≥5000 点/s 时帧恒为 1000 点。
 
-### 5.4 其余参数
+### 5.4 backfill：历史回填（V1.7，可随时开关）
+
+**三种模式**：
+
+| 配置 | 含义 | 典型用法 |
+|---|---|---|
+| `backfill: all`（默认） | 从库内**最早的数据**开始全部同步，直到追平实时 | 新装，想把整个库搬过去 |
+| `backfill: 30d` | 只补**最近 30 天**（支持 `d` 单位，`1d=24h`，可写 `12h`/`1d12h`） | 只要最近一段时间 |
+| `backfill: 0` | 只同步"现在"往后的新数据，不碰历史 | 纯实时 |
+
+**怎么用（记住三条）**：
+
+1. **改配置 + 重启即生效**：`0 → 30d` 就补 30 天；`30d → 0` 就停在新进度继续追；
+   **不需要清任何数据目录**。
+2. **只在"值变化"时回拨一次游标**：配置不变重启绝不会重发历史；想再补一次，把值改一下
+   （如 `30d → 0` 重启、再改回 `30d` 重启）即可重新触发。
+3. **库内数据比回拨边界晚也不怕**：程序先定位库内最早数据（`SHOW SHARD GROUPS` 元数据
+   查询，秒级），真空区直接跳过——"库里只有 10 天数据、配了 30d/all"就从 10 天前开始搬，
+   不会空爬。
+
+**升级提醒**：已在运行的旧部署升级到 V1.7 后，默认 `all` **不会**触发全库重发
+（旧进度被识别为"存量部署"，只记录配置值、游标不动）；想补历史，按上面第 1 条
+改配置即可。
+
+**回填期间的目标库**：新旧数据并存——`sync_e2e_delay_seconds` 会显示 0~1s（实时新数据
+已到），但总条数在慢慢涨；回填进度看 `sync_delay_seconds`（游标离"现在"的距离收敛）。
+
+### 5.5 其余参数
 
 - **延迟敏感**：轮询路径 watermark=2s（e2e ~2.5s）；**安全优先**：watermark=5s+；
   要亚秒级请启用快路径（`fast_path.listen`，见 docs/a4-fast-path.md）——
@@ -217,7 +246,7 @@ query_limit=500000、poller_parallel=4、WAL 64MB、monitor :28080。
 | sync.fast_path.mode | auto | off=仅信号 / auto=游标追平自动启用 / on=强制 |
 | sync.fast_path.activate_age / deactivate_age | watermark+3s / 30s | 自动启用/退避阈值（迟滞） |
 | sync.fast_path.dedup_window | watermark+5s | 快路径→轮询去重集保留窗口 |
-| sync.backfill | 0 | 首次回填 |
+| sync.backfill | all | 回填模式：all=全量（默认）/0=仅实时/Nd=有界回填（d=天） |
 | wal.segment_size | 64MB | 段大小 |
 | tcp.timeout / dial_timeout | 10s | sender TCP 读写/拨号 |
 | tcp.compression | zstd | 帧压缩：zstd（V1.6 默认）/ gzip（兼容旧接收端） |

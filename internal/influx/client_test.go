@@ -515,3 +515,51 @@ func TestSchemaReuseLastGoodOnMetaFailure(t *testing.T) {
 		t.Fatalf("expected degraded entry, got %+v", e)
 	}
 }
+
+// TestProbeOldestDataByShards SHOW SHARD GROUPS 路径：取本库最早 start_time。
+func TestProbeOldestDataByShards(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("q")
+		if strings.HasPrefix(q, "SHOW SHARD GROUPS") {
+			// 两个分片组：最早 2026-08-01T00:00:00Z
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"power","columns":["id","database","retention_policy","shard_group","start_time","end_time","expiry_time"],
+			"values":[[1,"power","autogen",1,"2026-08-08T00:00:00Z","2026-08-15T00:00:00Z","2026-08-22T00:00:00Z"],
+			          [2,"power","autogen",2,"2026-08-01T00:00:00Z","2026-08-08T00:00:00Z","2026-08-15T00:00:00Z"],
+			          [3,"other","autogen",3,"2020-01-01T00:00:00Z","2020-01-02T00:00:00Z","2020-01-09T00:00:00Z"]]}]}]}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	c, err := NewClient(Config{URL: srv.URL, Database: "power", Timeout: "5s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := time.Parse(time.RFC3339, "2026-08-01T00:00:00Z")
+	got, err := c.ProbeOldestData(context.Background())
+	if err != nil || got != want.UnixNano() {
+		t.Fatalf("oldest=%d err=%v, want %d", got, err, want.UnixNano())
+	}
+}
+
+// TestProbeOldestDataEmptyShards SHOW SHARD GROUPS 无分片 → 回退 count 二分；空库返回 0。
+func TestProbeOldestDataEmptyFallback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("q")
+		if strings.HasPrefix(q, "SHOW SHARD GROUPS") {
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"power","columns":["id","database","retention_policy","shard_group","start_time","end_time","expiry_time"],"values":[]}]}]}`)
+			return
+		}
+		// count 查询恒 0（空库）
+		fmt.Fprint(w, `{"results":[{"series":[{"name":"telemetry","columns":["time","count_value"],"values":[[0,0]]}]}]}`)
+	}))
+	defer srv.Close()
+	c, err := NewClient(Config{URL: srv.URL, Database: "power", Timeout: "5s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.ProbeOldestData(context.Background())
+	if err != nil || got != 0 {
+		t.Fatalf("empty db: oldest=%d err=%v, want 0", got, err)
+	}
+}

@@ -71,6 +71,7 @@ type WAL struct {
 	lockFile  *os.File      // 目录锁（防多实例并发）
 	lastCp    time.Time     // 上次 checkpoint 持久化时间（Commit 节流用）
 	notify    chan struct{} // 新增帧通知（cap=1，非阻塞），供 Sender 空闲唤醒
+	legacyCheckpoint bool   // checkpoint 文件为 V1.6 及更早格式（无 backfill_ns）——升级只记录不回拨
 }
 
 // Open 打开（或创建）WAL。segSize<=0 时用默认 64MB。
@@ -92,11 +93,12 @@ func Open(dir string, segSize int64) (*WAL, error) {
 	}
 	w := &WAL{dir: dir, dlqDir: filepath.Join(filepath.Dir(dir), "dlq"), segSize: segSize, dlqMax: DefaultDLQMaxSize, lockFile: lockFile, notify: make(chan struct{}, 1)}
 
-	cp, err := loadCheckpoint(dir)
+	cp, legacy, err := loadCheckpoint(dir)
 	if err != nil {
 		return nil, err
 	}
 	w.cp = cp
+	w.legacyCheckpoint = legacy
 
 	if err := w.scanSegments(); err != nil {
 		return nil, err
@@ -640,6 +642,46 @@ func (w *WAL) SetCursor(ts int64) error {
 	}
 	w.cp.CursorNs = ts
 	return w.persistLocked()
+}
+
+// ApplyBackfillPolicy 应用回填策略（V1.7）。
+//
+// policyNs：0=仅实时 / BackfillAllNs(-1)=全量 / >0=有界回填时长（ns）。
+// boundaryNs：回填边界（"全量"=库内最早数据时间；"有界"=max(now-policyNs, 最早数据)；
+// "仅实时"忽略）。规则：
+//   - 存量旧 checkpoint（无 backfill_ns 字段）首次升级：只记录 policyNs，**游标不动**
+//     （防升级即全库重发）；
+//   - policyNs 与记录值相同：什么都不做（正常重启绝不回拨）；
+//   - policyNs 变化且 >0/-1：游标 = min(当前游标, boundaryNs)（**唯一允许游标回退的路径**，
+//     目标库幂等覆盖保证安全），持久化新值。
+//
+// 返回是否发生了游标回拨。
+func (w *WAL) ApplyBackfillPolicy(policyNs, boundaryNs int64) (bool, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.legacyCheckpoint {
+		// 存量部署升级：只记录，不回拨（升级前后行为一致）
+		w.legacyCheckpoint = false
+		w.cp.BackfillNs = policyNs
+		return false, w.persistLocked()
+	}
+	if w.cp.BackfillNs == policyNs {
+		return false, nil
+	}
+	rewound := false
+	if policyNs != BackfillNoneNs && boundaryNs > 0 && boundaryNs < w.cp.CursorNs {
+		w.cp.CursorNs = boundaryNs
+		rewound = true
+	}
+	w.cp.BackfillNs = policyNs
+	return rewound, w.persistLocked()
+}
+
+// BackfillPolicyNs 返回 checkpoint 记录的回填策略值（测试/观测用）。
+func (w *WAL) BackfillPolicyNs() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.cp.BackfillNs
 }
 
 // Cursor 返回当前逻辑游标。

@@ -58,8 +58,6 @@ type SenderConfig struct {
 		FastPath          struct {
 			Listen        string `yaml:"listen"`         // A4 fast-path 订阅监听地址；空=禁用
 			Mode          string `yaml:"mode"`           // off=仅信号 / auto=游标追平自动启用（默认） / on=强制转发
-			ActivateAge   string `yaml:"activate_age"`   // auto：cursor 年龄 ≤ 此值启用（默认 watermark+3s）
-			DeactivateAge string `yaml:"deactivate_age"` // auto：年龄 > 此值退回仅信号（迟滞，默认 30s）
 			DedupWindow   string `yaml:"dedup_window"`   // 去重集保留窗口（默认 watermark+5s）
 		} `yaml:"fast_path"`
 		Backfill     string   `yaml:"backfill"`     // 首次启动回填：游标初始化为 now-watermark-backfill
@@ -209,8 +207,6 @@ func (c *SenderConfig) Validate() error {
 		"sync.watermark":                c.Sync.Watermark,
 		"sync.max_window":               c.Sync.MaxWindow,
 		"sync.signal_min_interval":      c.Sync.SignalMinInterval,
-		"sync.fast_path.activate_age":   c.Sync.FastPath.ActivateAge,
-		"sync.fast_path.deactivate_age": c.Sync.FastPath.DeactivateAge,
 		"sync.fast_path.dedup_window":   c.Sync.FastPath.DedupWindow,
 		"sync.backfill":                 c.Sync.Backfill,
 		"tcp.timeout":                   c.TCP.Timeout,
@@ -232,6 +228,11 @@ func (c *SenderConfig) Validate() error {
 	if cp := c.TCP.Compression; cp != "" && cp != "zstd" && cp != "gzip" {
 		return fmt.Errorf("config: tcp.compression must be zstd/gzip, got %q", cp)
 	}
+	if b := strings.TrimSpace(c.Sync.Backfill); b != "" && b != "all" && b != "0" {
+		if _, err := parseDurationExt(b); err != nil {
+			return fmt.Errorf("config: sync.backfill must be all/0/时长(如 30d), got %q", b)
+		}
+	}
 	return nil
 }
 
@@ -245,11 +246,12 @@ func (c *SenderConfig) CompressionFrameType() uint8 {
 }
 
 // validateDur 校验时长配置：空合法（用默认值），非空必须可解析且非负。
+// 支持扩展单位 d（天）=24h（V1.7）。
 func validateDur(name, s string) error {
 	if s == "" {
 		return nil
 	}
-	d, err := time.ParseDuration(s)
+	d, err := parseDurationExt(s)
 	if err != nil {
 		return fmt.Errorf("config: %s: bad duration %q: %w", name, s, err)
 	}
@@ -290,11 +292,50 @@ func dur(s string, def time.Duration) time.Duration {
 	if s == "" {
 		return def
 	}
-	d, err := time.ParseDuration(s)
+	d, err := parseDurationExt(s)
 	if err != nil {
 		return def
 	}
 	return d
+}
+
+// parseDurationExt 解析扩展时长：在 time.ParseDuration 基础上支持 d（天）=24h。
+// 例：30d、1d12h、0.5d、12h30m。负值允许解析（由 validateDur 拒绝）。
+func parseDurationExt(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty duration")
+	}
+	var sb strings.Builder
+	i := 0
+	for i < len(s) {
+		j := i
+		for j < len(s) && (s[j] == '-' || s[j] == '+' || s[j] == '.' || (s[j] >= '0' && s[j] <= '9')) {
+			j++
+		}
+		if j == i {
+			return 0, fmt.Errorf("invalid duration %q", s)
+		}
+		num := s[i:j]
+		k := j
+		for k < len(s) && !(s[k] == '-' || s[k] == '+' || s[k] == '.' || (s[k] >= '0' && s[k] <= '9')) {
+			k++
+		}
+		unit := s[j:k]
+		if unit == "d" {
+			f, err := strconv.ParseFloat(num, 64)
+			if err != nil {
+				return 0, fmt.Errorf("invalid day value %q in %q", num, s)
+			}
+			sb.WriteString(strconv.FormatFloat(f*24, 'f', -1, 64))
+			sb.WriteString("h")
+		} else {
+			sb.WriteString(num)
+			sb.WriteString(unit)
+		}
+		i = k
+	}
+	return time.ParseDuration(sb.String())
 }
 
 // PollerConfig 转换。
@@ -323,18 +364,44 @@ func (c *SenderConfig) WatermarkDuration() time.Duration {
 func (c *SenderConfig) FastPathConfig() sender.FastPathConfig {
 	watermark := c.WatermarkDuration()
 	return sender.FastPathConfig{
-		Mode:          sender.FastPathMode(c.Sync.FastPath.Mode),
-		ActivateAge:   dur(c.Sync.FastPath.ActivateAge, watermark+3*time.Second),
-		DeactivateAge: dur(c.Sync.FastPath.DeactivateAge, 30*time.Second),
-		DedupWindow:   dur(c.Sync.FastPath.DedupWindow, watermark+5*time.Second),
-		Measurements:  c.Sync.Measurements,
-		Compression:   c.CompressionFrameType(),
+		Mode:         sender.FastPathMode(c.Sync.FastPath.Mode),
+		DedupWindow:  dur(c.Sync.FastPath.DedupWindow, watermark+5*time.Second),
+		Measurements: c.Sync.Measurements,
+		Compression:  c.CompressionFrameType(),
 	}
 }
 
 // BackfillDuration 返回首次启动回填时长。
-func (c *SenderConfig) BackfillDuration() time.Duration {
-	return dur(c.Sync.Backfill, 0)
+// BackfillMode 回填模式（V1.7）。
+type BackfillMode int
+
+const (
+	BackfillNone     BackfillMode = iota // 0：仅实时
+	BackfillAll                          // all：全量同步（默认）
+	BackfillDuration                     // Nd：有界回填
+)
+
+// BackfillSpec 解析后的回填配置。
+type BackfillSpec struct {
+	Mode BackfillMode
+	Dur  time.Duration // 仅 BackfillDuration 有效
+}
+
+// BackfillSpec 解析 sync.backfill：默认（空）与 "all" 均按全量处理；"0" 为仅实时；
+// 其余为时长（支持 d）。解析失败回退全量（Validate 已先行拦截）。
+func (c *SenderConfig) BackfillSpec() BackfillSpec {
+	v := strings.TrimSpace(c.Sync.Backfill)
+	if v == "" || v == "all" {
+		return BackfillSpec{Mode: BackfillAll}
+	}
+	if v == "0" || v == "0s" {
+		return BackfillSpec{Mode: BackfillNone}
+	}
+	d, err := parseDurationExt(v)
+	if err != nil || d <= 0 {
+		return BackfillSpec{Mode: BackfillAll}
+	}
+	return BackfillSpec{Mode: BackfillDuration, Dur: d}
 }
 
 // SenderConfig 转换（发送循环）。

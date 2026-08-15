@@ -740,3 +740,145 @@ func truncate(s string, n int) string {
 	}
 	return s[:n] + "..."
 }
+
+// ProbeOldestData 返回库内最早数据时间（ns）；库为空返回 0。
+// V1.7 回填用：优先 SHOW SHARD GROUPS（单条元数据查询、精确），
+// 失败时回退 count 二分（指数扩展 + 二分收敛，~30~50 次 count 查询）。
+func (c *Client) ProbeOldestData(ctx context.Context) (int64, error) {
+	if oldest, err := c.oldestByShards(ctx); err == nil && oldest > 0 {
+		return oldest, nil
+	}
+	return c.oldestByCountBinary(ctx)
+}
+
+// oldestByShards 用 SHOW SHARD GROUPS 的 start_time 最小值定位最早数据。
+// 行结构：id, database, retention_policy, shard_group, start_time, end_time, expiry_time。
+func (c *Client) oldestByShards(ctx context.Context) (int64, error) {
+	rows, err := c.queryMeta(ctx, `SHOW SHARD GROUPS`)
+	if err != nil {
+		return 0, err
+	}
+	var oldest int64
+	for _, row := range rows {
+		if len(row) < 5 {
+			continue
+		}
+		if db, ok := row[1].(string); !ok || db != c.cfg.Database {
+			continue
+		}
+		s, ok := row[4].(string)
+		if !ok {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			continue
+		}
+		if oldest == 0 || t.UnixNano() < oldest {
+			oldest = t.UnixNano()
+		}
+	}
+	if oldest == 0 {
+		return 0, fmt.Errorf("influx: no shard groups found")
+	}
+	return oldest, nil
+}
+
+// oldestByCountBinary count 二分定位最早数据：先指数扩展窗口到 count 不再增长，
+// 再在最后一个增长区间内二分收敛。库为空返回 0。
+func (c *Client) oldestByCountBinary(ctx context.Context) (int64, error) {
+	now := time.Now().UnixNano()
+	const base = int64(time.Hour)
+	prev := int64(-1)
+	lo, hi, total := int64(0), now, int64(0)
+	found := false
+	for i := 0; i < 40; i++ {
+		span := base << uint(i)
+		if span <= 0 || now-span < 0 { // 溢出/越界防护
+			span = now
+		}
+		cnt, err := c.countPoints(ctx, now-span, now)
+		if err != nil {
+			return 0, err
+		}
+		if cnt == 0 && i >= 4 {
+			return 0, nil // 连续 5 轮全空：空库
+		}
+		if cnt > 0 && i > 0 && cnt == prev {
+			// 本轮扩展的 [now-2^i·base, now-2^(i-1)·base) 未新增数据：
+			// 全部数据都在 [now-2^(i-1)·base, now) 内
+			lo = now - base<<uint(i-1)
+			hi = now
+			total = cnt
+			found = true
+			break
+		}
+		prev = cnt
+	}
+	if !found {
+		return 0, fmt.Errorf("influx: oldest data search window exhausted")
+	}
+	// 二分：找 count(mid,now)==total 的最小 mid（最早数据时间）。
+	// count 随 mid 减小单调不减：cnt>=total → 数据全在 mid 之后 → hi=mid；否则 lo=mid。
+	for hi-lo > int64(time.Millisecond) {
+		mid := lo + (hi-lo)/2
+		cnt, err := c.countPoints(ctx, mid, now)
+		if err != nil {
+			return 0, err
+		}
+		if cnt >= total {
+			hi = mid
+		} else {
+			lo = mid
+		}
+	}
+	return hi, nil
+}
+
+// countPoints 统计 [start, end) 内总点数（跨 measurement 求和）。
+func (c *Client) countPoints(ctx context.Context, start, end int64) (int64, error) {
+	q := fmt.Sprintf("SELECT count(*) FROM /.*/ WHERE time >= %dns AND time < %dns", start, end)
+	u := fmt.Sprintf("%s/query?db=%s&epoch=ns&q=%s", c.cfg.URL, url.QueryEscape(c.cfg.Database), url.QueryEscape(q))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return 0, err
+	}
+	c.setAuth(req)
+	resp, err := c.do(req, 15*time.Second)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return 0, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("influx: count http %d", resp.StatusCode)
+	}
+	var qr queryResult
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	if err := dec.Decode(&qr); err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, res := range qr.Results {
+		if res.Err != "" {
+			return 0, fmt.Errorf("%s", res.Err)
+		}
+		for _, s := range res.Series {
+			for _, row := range s.Values {
+				if len(row) < 2 {
+					continue
+				}
+				if n, ok := row[1].(json.Number); ok {
+					if v, err := n.Int64(); err == nil {
+						total += v
+					}
+				}
+			}
+		}
+	}
+	return total, nil
+}

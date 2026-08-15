@@ -63,14 +63,60 @@ func run() error {
 	}
 	defer walInst.Close()
 
-	// 首次启动（无 checkpoint）：游标初始化为 now-watermark-backfill，
-	// 只同步最近数据（backfill 可回填更早的历史）；避免从 epoch 逐窗口爬行
+	// 回填策略（V1.7）：all=全量（默认）/ 0=仅实时 / Nd=有界回填（支持 d 单位）。
+	// 数据起点探测：定位库内最早数据，避免"回拨边界早于实际数据"时空爬。
+	spec := cfg.BackfillSpec()
+	now := time.Now().UnixNano()
+	var oldest int64
+	if spec.Mode != config.BackfillNone {
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), 60*time.Second)
+		if o, err := influxClient.ProbeOldestData(probeCtx); err == nil {
+			oldest = o
+		} else {
+			log.Warn("probe oldest data failed, use configured boundary only", zap.Error(err))
+		}
+		probeCancel()
+	}
+	// 回拨边界与 checkpoint 策略值（存量旧 checkpoint 只记录不回拨，见 WAL.ApplyBackfillPolicy）
+	policyNs, boundaryNs := int64(0), int64(0)
+	switch spec.Mode {
+	case config.BackfillAll:
+		policyNs, boundaryNs = wal.BackfillAllNs, oldest
+	case config.BackfillDuration:
+		policyNs = int64(spec.Dur)
+		boundaryNs = now - policyNs
+		if oldest > 0 && oldest > boundaryNs {
+			boundaryNs = oldest // 真空区直接越过（库内最早数据晚于回拨边界）
+		}
+	}
+	rewound, err := walInst.ApplyBackfillPolicy(policyNs, boundaryNs)
+	if err != nil {
+		return fmt.Errorf("apply backfill policy: %w", err)
+	}
+	if rewound {
+		log.Info("backfill policy changed: cursor rewound",
+			zap.Int64("cursor", walInst.Cursor()), zap.Int64("boundary", boundaryNs))
+	}
+
+	// 首次启动（无 checkpoint）：游标初始化为回填边界（all=库内最早数据 /
+	// Nd=now-Nd（或最早数据）/ 0=now-watermark）
 	if walInst.Cursor() == 0 {
-		init := time.Now().UnixNano() - int64(cfg.WatermarkDuration()+cfg.BackfillDuration())
+		init := now - int64(cfg.WatermarkDuration())
+		switch spec.Mode {
+		case config.BackfillAll:
+			if oldest > 0 {
+				init = oldest
+			}
+		case config.BackfillDuration:
+			if boundaryNs > 0 {
+				init = boundaryNs
+			}
+		}
 		if err := walInst.SetCursor(init); err != nil {
 			return fmt.Errorf("init cursor: %w", err)
 		}
-		log.Info("first start: cursor initialized", zap.Int64("cursor", init))
+		log.Info("first start: cursor initialized",
+			zap.Int64("cursor", init), zap.String("backfill_mode", fmt.Sprint(spec.Mode)))
 	}
 	log.Info("wal restored",
 		zap.Int64("cursor", walInst.Cursor()),

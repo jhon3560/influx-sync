@@ -91,54 +91,37 @@ func TestFastPathOnForwards(t *testing.T) {
 	}
 }
 
-// TestFastPathAutoStateMachine auto 模式：游标落后 → 仅信号；追平 → 透传；再落后 → 退回仅信号。
-func TestFastPathAutoStateMachine(t *testing.T) {
-	cfg := FastPathConfig{Mode: FastPathAuto, ActivateAge: 5 * time.Second, DeactivateAge: 30 * time.Second}
+// TestFastPathImmediateActive V1.7：auto/on 启用即转发——即使游标落后 30 天（回填中），
+// 实时数据也立即透传，不再等追平；off 仍为仅信号。
+func TestFastPathImmediateActive(t *testing.T) {
+	cfg := FastPathConfig{Mode: FastPathAuto}
 	fp, w, m, _, done := newTestFastPath(t, cfg)
 	defer done()
-	// 游标落后 1 小时：WAITING
-	old := time.Now().Add(-time.Hour).UnixNano()
-	fp.SetCursor(old)
-	if fp.Active() {
-		t.Fatal("must be waiting while cursor lags")
+	// 游标落后 30 天（历史回填中）：仍应立即转发
+	fp.SetCursor(time.Now().Add(-30 * 24 * time.Hour).UnixNano())
+	if !fp.Active() {
+		t.Fatal("auto mode must be active immediately (no catch-up gate)")
 	}
 	pushBody(t, fp, "m value=1 1720000000000000000\n")
-	if w.PendingCount() != 0 || m.FastPathSignalOnly() != 1 {
-		t.Fatalf("waiting: pending=%d sig=%d", w.PendingCount(), m.FastPathSignalOnly())
-	}
-	// 追平：ACTIVE
-	fp.SetCursor(time.Now().Add(-time.Second).UnixNano())
-	if !fp.Active() {
-		t.Fatal("must activate after catch-up")
-	}
-	pushBody(t, fp, "m value=2 1720000000000000000\n")
 	if w.PendingCount() != 1 || m.FastPathPoints() != 1 {
 		t.Fatalf("active: pending=%d pts=%d", w.PendingCount(), m.FastPathPoints())
 	}
-	// 再次落后（迟滞阈值之外）：退回 WAITING
-	fp.SetCursor(time.Now().Add(-time.Hour).UnixNano())
-	if fp.Active() {
-		t.Fatal("must deactivate after lag")
-	}
-	pushBody(t, fp, "m value=3 1720000000000000000\n")
-	if w.PendingCount() != 1 || m.FastPathSignalOnly() != 2 {
-		t.Fatalf("deactivated: pending=%d sig=%d", w.PendingCount(), m.FastPathSignalOnly())
+	if m.FastPathSignalOnly() != 0 {
+		t.Fatalf("sig=%d, want 0", m.FastPathSignalOnly())
 	}
 }
 
-// TestFastPathAutoHysteresis 迟滞：阈值附近小幅抖动不翻转。
-func TestFastPathAutoHysteresis(t *testing.T) {
-	cfg := FastPathConfig{Mode: FastPathAuto, ActivateAge: 5 * time.Second, DeactivateAge: 30 * time.Second}
-	fp, _, _, _, done := newTestFastPath(t, cfg)
+// TestFastPathOnModeForward V1.7：on 与 auto 行为一致（立即转发）。
+func TestFastPathOnModeForward(t *testing.T) {
+	fp, w, m, _, done := newTestFastPath(t, FastPathConfig{Mode: FastPathOn})
 	defer done()
-	fp.SetCursor(time.Now().Add(-time.Second).UnixNano()) // 激活
+	fp.SetCursor(time.Now().Add(-time.Hour).UnixNano())
 	if !fp.Active() {
-		t.Fatal("must activate")
+		t.Fatal("on mode must be active")
 	}
-	// 年龄回到 10s（>5s 但 <30s）：迟滞区内保持 ACTIVE
-	fp.SetCursor(time.Now().Add(-10 * time.Second).UnixNano())
-	if !fp.Active() {
-		t.Fatal("hysteresis: must stay active within deactivate threshold")
+	pushBody(t, fp, "m value=1 1720000000000000000\n")
+	if w.PendingCount() != 1 || m.FastPathPoints() != 1 {
+		t.Fatalf("pending=%d pts=%d", w.PendingCount(), m.FastPathPoints())
 	}
 }
 

@@ -230,3 +230,50 @@ func TestMinSignalIntervalWired(t *testing.T) {
 		t.Fatalf("default MinSignalInterval=%v, want 200ms", got)
 	}
 }
+
+func TestParseDurationExt(t *testing.T) {
+	cases := map[string]time.Duration{
+		"30d":      30 * 24 * time.Hour,
+		"1d12h":    36 * time.Hour,
+		"0.5d":     12 * time.Hour,
+		"12h30m":   12*time.Hour + 30*time.Minute,
+		"90s":      90 * time.Second,
+		"1d1h1m1s": 25*time.Hour + time.Minute + time.Second,
+	}
+	for in, want := range cases {
+		got, err := parseDurationExt(in)
+		if err != nil || got != want {
+			t.Fatalf("parseDurationExt(%q)=%v,%v want %v", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"", "abc", "1x", "d", "1.2.3d", "30dd"} {
+		if _, err := parseDurationExt(bad); err == nil {
+			t.Fatalf("parseDurationExt(%q) must fail", bad)
+		}
+	}
+}
+
+func TestBackfillSpec(t *testing.T) {
+	cases := []struct {
+		in   string
+		mode BackfillMode
+		dur  time.Duration
+	}{
+		{"", BackfillAll, 0},
+		{"all", BackfillAll, 0},
+		{"0", BackfillNone, 0},
+		{"0s", BackfillNone, 0},
+		{"30d", BackfillDuration, 30 * 24 * time.Hour},
+		{"12h", BackfillDuration, 12 * time.Hour},
+	}
+	for _, c := range cases {
+		s := (&SenderConfig{}).BackfillSpec
+		_ = s
+		cfg := &SenderConfig{}
+		cfg.Sync.Backfill = c.in
+		got := cfg.BackfillSpec()
+		if got.Mode != c.mode || got.Dur != c.dur {
+			t.Fatalf("BackfillSpec(%q)=%v/%v want %v/%v", c.in, got.Mode, got.Dur, c.mode, c.dur)
+		}
+	}
+}

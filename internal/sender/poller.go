@@ -72,10 +72,30 @@ type Poller struct {
 	wakeupScheduled atomic.Bool   // watermark 解锁自唤醒定时器是否已安排（原子，防竞态）
 
 	fastPath *FastPath // A4 快路径（nil=未启用）；查询归并后过滤已转发点
+
+	emptyStreak int // 连续空查询窗口计数（V1.7 回填空窗自适应跳过）
 }
+
+// emptySkipMaxWindow 空窗自适应跳过的窗口上限：真空区按 5s→10s→…→1h 翻倍，
+// 命中数据即复位。正常数据窗口仍受 MaxWindow(30s) 约束（见 pollOnce）。
+const emptySkipMaxWindow = time.Hour
 
 // SetFastPath 注入快路径转发器（A4；nil 时轮询行为与旧版完全一致）。
 func (p *Poller) SetFastPath(fp *FastPath) { p.fastPath = fp }
+
+// windowSize 计算本轮查询窗口：连续空窗时翻倍（上限 1h），用于快速越过
+// "回拨边界早于库内最早数据"的真空区（正常路径由启动时数据起点探测覆盖，
+// 此处兜底运行期出现真空的情况）。
+func (p *Poller) windowSize() time.Duration {
+	w := p.cfg.Window
+	for i := 0; i < p.emptyStreak && w < emptySkipMaxWindow; i++ {
+		w *= 2
+	}
+	if w > emptySkipMaxWindow {
+		w = emptySkipMaxWindow
+	}
+	return w
+}
 
 // NewPoller 创建轮询器。
 func NewPoller(client *influx.Client, w *wal.WAL, metrics *monitor.Metrics, logger *zap.Logger, cfg PollerConfig) *Poller {
@@ -252,13 +272,17 @@ func WalDiskUsageRatio(dir string) float64 {
 func (p *Poller) pollOnce(ctx context.Context) (blocked bool) {
 	now := time.Now().UnixNano()
 	cursor := p.wal.Cursor()
-	end := cursor + int64(p.cfg.Window)
+	// V1.7：窗口大小 = 基础窗口 × 空窗翻倍（真空区快速越过）；正常数据窗口
+	// 仍受 MaxWindow 上限保护
+	window := p.windowSize()
+	end := cursor + int64(window)
 	if maxEnd := now - int64(p.cfg.Watermark); end > maxEnd {
 		end = maxEnd
 		blocked = true
 	}
-	// 窗口上限保护：即使时间跳变/积压，单次最多查 MaxWindow
-	if end-cursor > int64(p.cfg.MaxWindow) {
+	// 窗口上限保护：即使时间跳变/积压，单次最多查 MaxWindow（空窗翻倍除外——
+	// 空查询开销小，翻倍上限见 windowSize）
+	if p.emptyStreak == 0 && end-cursor > int64(p.cfg.MaxWindow) {
 		end = cursor + int64(p.cfg.MaxWindow)
 	}
 	if end <= cursor {
@@ -270,7 +294,13 @@ func (p *Poller) pollOnce(ctx context.Context) (blocked bool) {
 		p.logger.Warn("query failed, keep cursor", zap.Error(err))
 		return false // 保持游标，下轮重试
 	}
-	// A4：更新快路径状态机/去重集驱逐基准（每轮，无论是否过滤）
+	// V1.7：空窗计数——连续空窗翻倍跳过；命中数据复位
+	if len(points) == 0 {
+		p.emptyStreak++
+	} else {
+		p.emptyStreak = 0
+	}
+	// A4：更新快路径去重集驱逐基准（每轮，无论是否过滤）
 	if p.fastPath != nil {
 		p.fastPath.SetCursor(cursor)
 		// 过滤已由快路径转发的点（登记在 WAL 成功后 ⟹ 跳过即已转发，零丢失）

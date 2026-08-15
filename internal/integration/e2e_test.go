@@ -4,6 +4,7 @@ package integration
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -415,4 +416,184 @@ func TestEndToEndFastPath(t *testing.T) {
 	if totalLines.Load() < int64(len(pushed)) {
 		t.Fatalf("total lines=%d", totalLines.Load())
 	}
+}
+
+// TestEndToEndBackfillAllV17 V1.7 语义 e2e：
+// ① 新装 backfill=all：游标=库内最早数据，全量同步（含比"现在"早 2 分钟的旧数据）；
+// ② 追平后同值重启不回拨；③ 配置变化（all→0→all）重新回拨，目标库计数不重复（幂等）。
+func TestEndToEndBackfillAllV17(t *testing.T) {
+	const step = int64(100_000_000) // 100ms 网格
+	now := time.Now().UnixNano()
+	// SHOW SHARD GROUPS 的 start_time 为秒级 RFC3339：对齐整秒避免亚秒差异
+	oldest := (now - 40*time.Second.Nanoseconds()) / int64(time.Second) * int64(time.Second)
+	oldest = oldest / step * step
+	dataEnd := (now - 2*time.Second.Nanoseconds()) / step * step // 数据写到 now-2s 为止（边界之外查询返回空）
+	var seq atomic.Int64
+	src := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("q")
+		if strings.HasPrefix(q, "SHOW SHARD GROUPS") {
+			st := time.Unix(0, oldest).UTC().Format(time.RFC3339)
+			fmt.Fprintf(w, `{"results":[{"series":[{"name":"power","columns":["id","database","retention_policy","shard_group","start_time","end_time","expiry_time"],"values":[[1,"power","autogen",1,%q,"2026-12-31T00:00:00Z","2027-01-07T00:00:00Z"]]}]}]}`, st)
+			return
+		}
+		if strings.HasPrefix(q, "SHOW TAG KEYS") {
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"telemetry","columns":["tagKey"],"values":[["plant"]]}]}]}`)
+			return
+		}
+		if strings.HasPrefix(q, "SHOW FIELD KEYS") {
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"telemetry","columns":["fieldKey","fieldType"],"values":[["value","float"]]}]}]}`)
+			return
+		}
+		var start, end int64
+		if _, err := fmt.Sscanf(q, "SELECT * FROM /.*/ WHERE time >= %dns AND time < %dns LIMIT %d", &start, &end); err != nil {
+			fmt.Sscanf(q, "SELECT * FROM \"telemetry\" WHERE time >= %dns AND time < %dns LIMIT %d", &start, &end)
+		}
+		if end > dataEnd {
+			end = dataEnd
+		}
+		var rows []string
+		first := (start + step - 1) / step * step
+		for ts := first; ts < end; ts += step {
+			rows = append(rows, fmt.Sprintf(`[%d,"A01",%d]`, ts, seq.Add(1)))
+		}
+		fmt.Fprintf(w, `{"results":[{"series":[{"name":"telemetry","columns":["time","plant","value"],"values":[%s]}]}]}`, strings.Join(rows, ","))
+	}))
+	t.Cleanup(src.Close)
+	// 目标库：模拟真实 InfluxDB 的幂等 upsert——同一 (series, ts) 重复写入只计一次。
+	// （真实目标库重复写不重复计数，重爬历史的幂等性必须在此语义下验证）
+	var targetLines atomic.Int64
+	var seenMu sync.Mutex
+	seen := map[int64]struct{}{}
+	tgt := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/write" {
+			http.NotFound(w, r)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		seenMu.Lock()
+		for _, l := range strings.Split(strings.TrimSpace(string(body)), "\n") {
+			if l == "" {
+				continue
+			}
+			i := strings.LastIndexByte(l, ' ')
+			if i < 0 {
+				continue
+			}
+			if ts, err := strconv.ParseInt(strings.TrimSpace(l[i+1:]), 10, 64); err == nil {
+				if _, dup := seen[ts]; !dup {
+					seen[ts] = struct{}{}
+					targetLines.Add(1)
+				}
+			}
+		}
+		seenMu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(tgt.Close)
+	rs, addr := startReceiverSrv(t, tgt.URL, filepath.Join(t.TempDir(), "last_seq"))
+	_ = rs
+
+	walDir := filepath.Join(t.TempDir(), "wal")
+	w, err := wal.Open(walDir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ic, err := influx.NewClient(influx.Config{URL: src.URL, Database: "power", Timeout: "5s"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics := monitor.New()
+	poller := sender.NewPoller(ic, w, metrics, testLogger(t), sender.PollerConfig{
+		Interval: 50 * time.Millisecond, Window: 500 * time.Millisecond, Watermark: 1 * time.Second,
+		BatchPoints: 500,
+	})
+	client := transport.NewClient(transport.ClientConfig{Addr: addr, Timeout: 3 * time.Second})
+	sl := sender.NewSender(w, client, metrics, testLogger(t), sender.SenderConfig{
+		MaxRetry: 5, BackoffBase: 50 * time.Millisecond, BackoffMax: 500 * time.Millisecond,
+		IdleSleep: 10 * time.Millisecond, HeartbeatInterval: time.Hour,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 模拟 cmd/sender V1.7 新装流程：探测最早数据 → 应用 all 策略 → 游标=最早数据
+	oldestProbe, err := ic.ProbeOldestData(ctx)
+	if err != nil || oldestProbe != oldest {
+		t.Fatalf("probe=%d err=%v want %d", oldestProbe, err, oldest)
+	}
+	if _, err := w.ApplyBackfillPolicy(wal.BackfillAllNs, oldestProbe); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.SetCursor(oldestProbe); err != nil {
+		t.Fatal(err)
+	}
+	go poller.Run(ctx)
+	go sl.Run(ctx)
+
+	// ① 全量回填：以目标库精确计数收敛（已知数据总量，等收到全量且 WAL 排空）
+	wantTotal := (dataEnd - oldest) / step // 半开区间 [start,end)：不含 dataEnd 本身
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if targetLines.Load() >= wantTotal && w.PendingCount() == 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got := targetLines.Load(); got != wantTotal {
+		t.Fatalf("backfill all: target=%d want=%d (cursor=%d)", got, wantTotal, w.Cursor())
+	}
+	cancel()
+	time.Sleep(200 * time.Millisecond)
+	w.Close()
+
+	// ② 同值重启：不回拨（cursor 保持在追平位置）
+	w2, err := wal.Open(walDir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursorBefore := w2.Cursor()
+	rewound, err := w2.ApplyBackfillPolicy(wal.BackfillAllNs, oldestProbe)
+	if err != nil || rewound || w2.Cursor() != cursorBefore {
+		t.Fatalf("same-value restart must not rewind: rewound=%v cursor %d->%d", rewound, cursorBefore, w2.Cursor())
+	}
+
+	// ③ 配置变化：all→0→all 触发重新回拨；重发历史幂等（目标计数不变）
+	if _, err := w2.ApplyBackfillPolicy(wal.BackfillNoneNs, 0); err != nil {
+		t.Fatal(err)
+	}
+	rewound, err = w2.ApplyBackfillPolicy(wal.BackfillAllNs, oldestProbe)
+	if err != nil || !rewound {
+		t.Fatalf("config change must rewind: rewound=%v err=%v", rewound, err)
+	}
+	if w2.Cursor() != oldestProbe {
+		t.Fatalf("rewound cursor=%d want %d", w2.Cursor(), oldestProbe)
+	}
+	w2.Close()
+	// 重爬一遍（用新 sender/receiver 会话走完）：目标库计数不重复
+	rs2, addr2 := startReceiverSrv(t, tgt.URL, filepath.Join(t.TempDir(), "last_seq2"))
+	_ = rs2
+	client2 := transport.NewClient(transport.ClientConfig{Addr: addr2, Timeout: 3 * time.Second})
+	sl2 := sender.NewSender(w2, client2, monitor.New(), testLogger(t), sender.SenderConfig{
+		MaxRetry: 5, BackoffBase: 50 * time.Millisecond, BackoffMax: 500 * time.Millisecond,
+		IdleSleep: 10 * time.Millisecond, HeartbeatInterval: time.Hour,
+	})
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	poller2 := sender.NewPoller(ic, w2, monitor.New(), testLogger(t), sender.PollerConfig{
+		Interval: 50 * time.Millisecond, Window: 500 * time.Millisecond, Watermark: 1 * time.Second,
+		BatchPoints: 500,
+	})
+	go poller2.Run(ctx2)
+	go sl2.Run(ctx2)
+	deadline = time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if w2.Cursor() >= dataEnd-int64(time.Second) && w2.PendingCount() == 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	cancel2()
+	if got := targetLines.Load(); got != wantTotal {
+		t.Fatalf("re-backfill must be idempotent: target=%d want=%d", got, wantTotal)
+	}
+	w2.Close()
 }

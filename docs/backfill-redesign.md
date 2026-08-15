@@ -1,4 +1,10 @@
-# backfill 重设计（V1.7.0 方案，评审稿）
+# backfill 重设计（V1.7.0 方案）
+
+> ✅ 已按本方案实施于 V1.7.0（见 git tag v1.7.0）。实现与本文差异：
+> ① 默认 `backfill: all`；② 快路径启用即透传（auto≡on，移除年龄门控）；
+> ③ checkpoint 记录 backfill 值、仅配置变化一次性回拨、存量升级只记录不回拨；
+> ④ 数据起点探测采用 SHOW SHARD GROUPS（回退 count 二分）+ 空窗翻倍跳过兜底。
+> 使用说明（易懂版）见 configuration.md §5.4 与 deployment.md §9。
 
 > 目标：① 实时同步"打开即生效"，不再等历史追平；② **默认全量同步（backfill: all）**，
 > 不管库内数据多早都直接同步；③ 历史回填成为可随时开启/关闭的选项，**无需清数据目录**；

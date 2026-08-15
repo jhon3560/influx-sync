@@ -37,9 +37,10 @@
 [III 区] 目标 InfluxDB(HXScada)
 ```
 
-> A4 快路径说明：历史同步由 Poller 全权负责（订阅只推送新写入）；快路径仅在游标追平
-> （cursor 年龄 ≤ activate_age）后透传，与轮询窗口重叠区由秒级分区去重集抑制重复转发；
-> 快路径只加速、不改变正确性基座（详见 docs/a4-fast-path.md）。
+> A4 快路径说明：历史同步由 Poller 全权负责（订阅只推送新写入）；V1.7 起快路径
+> **启用即透传**（不再等游标追平），与 `sync.backfill`（all/0/Nd，默认 all）的历史回填
+> 并行；重叠区由秒级分区去重集抑制重复转发。快路径只加速、不改变正确性基座
+> （详见 docs/a4-fast-path.md 与 docs/backfill-redesign.md）。
 
 ## 3. 模块划分（包职责）
 

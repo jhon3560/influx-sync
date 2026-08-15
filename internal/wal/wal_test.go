@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"influx-sync/internal/protocol"
 )
@@ -656,4 +657,127 @@ func TestMidSegmentCorruptionSkipsSingleRecord(t *testing.T) {
 	if st2.Size() != sizeBefore {
 		t.Fatalf("file truncated: %d -> %d (must skip single record, not whole tail)", sizeBefore, st2.Size())
 	}
+}
+
+// TestApplyBackfillPolicy V1.7：回拨策略——配置变化才回拨、不变不回拨、存量升级只记录。
+func TestApplyBackfillPolicy(t *testing.T) {
+	newWAL := func(t *testing.T, cursor int64) (*WAL, func()) {
+		t.Helper()
+		w, err := Open(filepath.Join(t.TempDir(), "wal"), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cursor > 0 {
+			if err := w.SetCursor(cursor); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return w, func() { w.Close() }
+	}
+	now := time.Now().UnixNano()
+
+	t.Run("config change rewinds once", func(t *testing.T) {
+		w, done := newWAL(t, now-int64(time.Hour)) // 游标在 1 小时前
+		defer done()
+		rewound, err := w.ApplyBackfillPolicy(int64(24*time.Hour), now-int64(24*time.Hour))
+		if err != nil || !rewound {
+			t.Fatalf("rewound=%v err=%v", rewound, err)
+		}
+		if w.Cursor() != now-int64(24*time.Hour) {
+			t.Fatalf("cursor=%d", w.Cursor())
+		}
+		// 同值再次应用：不回拨
+		rewound, err = w.ApplyBackfillPolicy(int64(24*time.Hour), now-int64(24*time.Hour))
+		if err != nil || rewound {
+			t.Fatalf("same value must not rewind: rewound=%v err=%v", rewound, err)
+		}
+	})
+
+	t.Run("no forward jump", func(t *testing.T) {
+		w, done := newWAL(t, now-int64(48*time.Hour)) // 游标已在更早位置
+		defer done()
+		rewound, err := w.ApplyBackfillPolicy(int64(24*time.Hour), now-int64(24*time.Hour))
+		if err != nil || rewound {
+			t.Fatalf("must not jump forward: rewound=%v err=%v", rewound, err)
+		}
+		if w.Cursor() != now-int64(48*time.Hour) {
+			t.Fatalf("cursor moved: %d", w.Cursor())
+		}
+	})
+
+	t.Run("none mode records without rewind", func(t *testing.T) {
+		w, done := newWAL(t, now-int64(time.Hour))
+		defer done()
+		rewound, err := w.ApplyBackfillPolicy(BackfillNoneNs, 0)
+		if err != nil || rewound {
+			t.Fatalf("none must not rewind: rewound=%v err=%v", rewound, err)
+		}
+		if w.BackfillPolicyNs() != BackfillNoneNs {
+			t.Fatalf("policy=%d", w.BackfillPolicyNs())
+		}
+	})
+
+	t.Run("all mode with boundary", func(t *testing.T) {
+		w, done := newWAL(t, now-int64(time.Hour))
+		defer done()
+		oldest := now - int64(10*24*time.Hour)
+		rewound, err := w.ApplyBackfillPolicy(BackfillAllNs, oldest)
+		if err != nil || !rewound {
+			t.Fatalf("rewound=%v err=%v", rewound, err)
+		}
+		if w.Cursor() != oldest {
+			t.Fatalf("cursor=%d want %d", w.Cursor(), oldest)
+		}
+		if w.BackfillPolicyNs() != BackfillAllNs {
+			t.Fatalf("policy=%d", w.BackfillPolicyNs())
+		}
+	})
+
+	t.Run("legacy checkpoint adopts without rewind", func(t *testing.T) {
+		dir := t.TempDir()
+		walDir := filepath.Join(dir, "wal")
+		w, err := Open(walDir, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := w.SetCursor(now - int64(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		w.Close()
+		// 模拟 V1.6 及更早的 checkpoint：删除 backfill_ns 字段
+		cpPath := filepath.Join(walDir, "checkpoint")
+		data, err := os.ReadFile(cpPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]interface{}
+		if err := json.Unmarshal(data, &m); err != nil {
+			t.Fatal(err)
+		}
+		delete(m, "backfill_ns")
+		legacy, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(cpPath, legacy, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// 重新打开：legacy 路径只记录 all、游标不动
+		w2, err := Open(walDir, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer w2.Close()
+		cursorBefore := w2.Cursor()
+		rewound, err := w2.ApplyBackfillPolicy(BackfillAllNs, now-int64(10*24*time.Hour))
+		if err != nil || rewound {
+			t.Fatalf("legacy must not rewind: rewound=%v err=%v", rewound, err)
+		}
+		if w2.Cursor() != cursorBefore {
+			t.Fatalf("legacy cursor moved: %d -> %d", cursorBefore, w2.Cursor())
+		}
+		if w2.BackfillPolicyNs() != BackfillAllNs {
+			t.Fatalf("policy=%d", w2.BackfillPolicyNs())
+		}
+	})
 }

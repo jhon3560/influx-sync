@@ -35,6 +35,8 @@ InfluxDB 跨正向隔离同步系统（ISFP 协议，V1.5.0）。
 | v1.4.2 | 复审修复（N6-N8）：永久缺口发送方权威闭合（去告警刷屏/恢复去重） + seq 从 1 开始文档化 + schema 降级复用历史成功条目（防类型冲突毒丸） |
 | v1.4.3 | 收尾加固：inflightSeq 引用计数（双保险不低估在途） + gapWarned 闭合/时间窗复位（Error 级可观测性不丢失） |
 | v1.5.0 | A4 订阅 fast-path 透传：推送批直进 WAL（同 gzip 管线），游标追平自动启用（auto/on/off 三态 + 迟滞），秒级分区去重集抑制轮询重复转发，WAL 并发追加 API，订阅改造成 ops 步骤（见 docs/a4-fast-path.md） |
+| v1.6.0 | 帧压缩支持 zstd（TypeDataZstd 帧类型即算法标识，Version=1 布局不变）；tcp.compression: zstd(默认)/gzip；本机压测链路带宽 zstd ≈ gzip 的 1/2~1/3 |
+| v1.7.0 | backfill 重设计：默认 all 全量同步（0=仅实时/Nd=有界，支持 d 单位）；快路径启用即透传（移除追平门控）；配置变化一次性回拨游标（免清数据目录，存量升级只记录不回拨）；SHOW SHARD GROUPS 数据起点定位 + 空窗翻倍跳过 |
 
 ## 目录
 

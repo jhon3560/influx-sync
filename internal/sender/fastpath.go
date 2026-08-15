@@ -21,7 +21,8 @@ import (
 	"influx-sync/internal/wal"
 )
 
-// FastPathMode 快路径模式：off=仅信号（=V1.4 及以前行为）/ auto=游标追平自动启用 / on=强制转发。
+// FastPathMode 快路径模式：off=仅信号 / auto、on=启用即透传（V1.7 起 auto≡on，
+// 不再等待游标追平——历史回填与实时透传并行，实时同步"打开就生效"）。
 type FastPathMode string
 
 const (
@@ -32,9 +33,7 @@ const (
 
 // FastPathConfig 快路径配置。
 type FastPathConfig struct {
-	Mode          FastPathMode  // off/auto/on，默认 auto
-	ActivateAge   time.Duration // auto 模式启用阈值：cursor 年龄 ≤ 此值才转发（默认 watermark+3s）
-	DeactivateAge time.Duration // auto 模式退避阈值：年龄 > 此值退回仅信号（迟滞，默认 30s）
+	Mode          FastPathMode  // off=仅信号 / on、auto（≡on，V1.7 起不再等游标追平）=立即透传
 	DedupWindow   time.Duration // 去重集保留窗口（默认 watermark+5s）
 	Measurements  []string      // 同步 measurement 白名单（与轮询路径一致；空=全部）
 	MaxBatchBytes int           // 单批上限（默认 MaxDecompressedLen）
@@ -151,19 +150,13 @@ type FastPath struct {
 	notify   func()         // Poller 信号回调（批处理成功后唤醒 Poller）
 	diskGate func() float64 // WAL 盘占用率（反压门）
 
-	active atomic.Bool // ACTIVE/WAITING 状态（mode=auto 由 cursor 年龄驱动；on=恒真）
+	active atomic.Bool // 是否转发（V1.7：启用即真，off 恒假——不再有游标年龄门控）
 }
 
 // NewFastPath 创建快路径转发器。
 func NewFastPath(w *wal.WAL, metrics *monitor.Metrics, logger *zap.Logger, cfg FastPathConfig, notify func(), diskGate func() float64) *FastPath {
 	if cfg.Mode == "" {
 		cfg.Mode = FastPathAuto
-	}
-	if cfg.ActivateAge <= 0 {
-		cfg.ActivateAge = 5 * time.Second
-	}
-	if cfg.DeactivateAge <= 0 {
-		cfg.DeactivateAge = 30 * time.Second
 	}
 	if cfg.MaxBatchBytes <= 0 {
 		cfg.MaxBatchBytes = protocol.MaxDecompressedLen
@@ -180,7 +173,8 @@ func NewFastPath(w *wal.WAL, metrics *monitor.Metrics, logger *zap.Logger, cfg F
 		notify:   notify,
 		diskGate: diskGate,
 	}
-	if cfg.Mode == FastPathOn {
+	// V1.7：启用即转发（off 除外）——实时同步"打开就生效"，与历史回填并行互不阻塞。
+	if cfg.Mode != FastPathOff {
 		fp.active.Store(true)
 	}
 	return fp
@@ -192,25 +186,9 @@ func (f *FastPath) Active() bool { return f.active.Load() }
 // Enabled 配置是否启用（listen 已配置）。
 func (f *FastPath) Enabled() bool { return f.cfg.Mode != FastPathOff }
 
-// SetCursor 由 Poller 每轮调用：更新去重集驱逐基准 + auto 模式状态机（迟滞防抖）。
+// SetCursor 由 Poller 每轮调用：更新去重集驱逐基准（V1.7：仅此职责，无状态机）。
 func (f *FastPath) SetCursor(cursorNs int64) {
 	f.dedup.SetCursor(cursorNs)
-	if f.cfg.Mode != FastPathAuto {
-		return
-	}
-	age := time.Now().UnixNano() - cursorNs
-	switch {
-	case !f.active.Load() && age <= int64(f.cfg.ActivateAge):
-		f.active.Store(true)
-		f.metrics.SetFastPathState(2)
-		f.logger.Info("fast path activated (wal cursor caught up)",
-			zap.Int64("cursor", cursorNs), zap.Duration("age", time.Duration(age)))
-	case f.active.Load() && age > int64(f.cfg.DeactivateAge):
-		f.active.Store(false)
-		f.metrics.SetFastPathState(1)
-		f.logger.Warn("fast path deactivated (wal cursor lagging), falling back to polling only",
-			zap.Int64("cursor", cursorNs), zap.Duration("age", time.Duration(age)))
-	}
 }
 
 // Filter 供 Poller 在查询归并后调用：剔除已由快路径转发的点。
