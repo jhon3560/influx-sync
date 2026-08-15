@@ -74,7 +74,7 @@
 
 | 决策 | 内容 | 理由 |
 |---|---|---|
-| 订阅事实约束 | InfluxDB 1.x **每库仅允许 1 个 subscription**；A4 复用现有订阅、把 fast_path 地址加为**第二个 DESTINATION**（`DESTINATIONS ALL 'signal','fastpath'`），需 ops DROP+CREATE（几秒推送中断，无数据影响） | 不能新建第二个订阅（会报 "subscription already exists"） |
+| 订阅事实约束 | InfluxDB 1.x **每库仅允许 1 个 subscription**，但一个订阅可挂**多个 DESTINATION**（`DESTINATIONS ALL` = 每笔写入推给所有目的地）。若现有订阅已被其他程序（如 hx_migrate）使用：**把 fast_path 地址追加为同一订阅的新目的地即可，两条程序各收各的完整数据，互不影响**；需 ops DROP+CREATE（无 ALTER 语法）。空窗影响：对 influx-sync 无数据影响（轮询兜底）；对纯订阅消费方（无轮询兜底）有数秒漏推，**建议低峰窗口执行**。必须保持 ALL 模式（ANY 模式轮询挑目的地，会各拿一半，不可用） | 不能新建第二个订阅（会报 "subscription already exists"）；不改动也能用，只是退回纯轮询（延迟=watermark+2s） |
 | 精度 | 快路径只接受 **ns 精度**批次（每行 ts 需落在 `[1e15, 5e18)`）；其余跳过整行由 Poller 兜底 | ns/µs 数值域重叠（1.75e15 既是 ns-1970 也是 µs-2025），无法可靠自动判别；本部署写入方统一 ns |
 | 批大小 | body 上限 = `MaxDecompressedLen`(16MB)；压缩后超 1MB 帧限 → 整批跳过由 Poller 兜底 | 复用协议现有限额 |
 | 行级容错 | 批内**逐行**解析：坏行/非 ns 行/非目标 measurement 行跳过，其余行仍转发；跳过的行由 Poller 兜底 | 单行坏数据不拖累整批实时性 |
