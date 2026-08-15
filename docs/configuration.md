@@ -138,11 +138,63 @@ query_limit=500000、poller_parallel=4、WAL 64MB、monitor :28080。
 | INFLUXSYNC_TCP_LISTEN | receiver 监听 |
 | INFLUXSYNC_MONITOR_ADDR / INFLUXSYNC_LOG_LEVEL | 通用 |
 
-## 5. 参数选择建议
+## 5. 参数选择建议（含 V1.5/V1.6 本机实测数据）
 
-- **延迟敏感**：watermark=2s（延迟 ~4.2s）；**安全优先**：watermark=5s+（~7s）
-- **吞吐**：batch_points 越大每帧点越多（上限受"压缩后 ≤1MB"约束，超限自动拆批）；
-  query_limit 大→分页少；poller_parallel 4 适合 20 万点/s
+### 5.1 batch_points：帧大小是吞吐/带宽/延迟的公共旋钮
+
+**协议约束**（不可违反，超限自动处理）：
+
+- 压缩后单帧 ≤1MB（隔离装置单包上限）；解压后 ≤16MB。超限时自动减半拆批
+  （不卡死），单点仍超限则跳过该点并计数（`point_skip_total`）。
+
+**经验公式**：实测（真实测点形态 LP，zstd L1）压缩率约 **10x**，行均 ~90B →
+单帧点数上限 ≈ `10 × 1MB / 行字节数` ≈ 11 万点——远大于常用 batch_points。
+**所以 batch_points 实际由实时性/内存/重传粒度决定，而不是压缩上限。**
+
+| 场景 | batch_points | 帧大小（原始→zstd） | 理由 |
+|---|---|---|---|
+| 高吞吐（≥10 万点/s） | 30000 | ~2.4MB → ~240KB | 帧数最少，停等 RTT 摊销最好 |
+| 均衡（默认） | 10000 | ~800KB → ~80KB | 吞吐/重传粒度/内存均衡 |
+| 低写入率/低延迟敏感 | 1000~5000 | 80~400KB → 8~40KB | 每帧处理快；小帧压缩率略降但绝对流量小 |
+
+- **吞吐公式**：停等链路吞吐 = `batch_points / RTT`。隔离装置 RTT 大时，
+  **优先加大 batch_points**（减半 = 吞吐减半）；V1.5 起另有
+  `pipeline_window` 滑窗（需装置验证后开启）。
+- **快路径不受 batch_points 影响**：订阅帧大小由源库 `[subscriber]`
+  `write-buffer-size` 与 `flush-interval` 决定（见 5.3）。
+
+### 5.2 压缩算法（V1.6）
+
+- `tcp.compression: zstd`（默认）/ `gzip`。本机实测链路带宽（5 万点/s）：
+  **zstd 1.2Mbps vs gzip 2.6Mbps**；10 万点/s：zstd 1.4~2.0Mbps vs gzip 2.5~3.2Mbps
+  ——zstd 约为 gzip 的 1/2~1/3，且发送端 CPU 更低。
+- zstd 需两端同版本（同一安装包部署即满足）；**混合版本升级期把两端都设回 gzip**。
+- **字典训练：实测不建议**。对 ≥500 点的帧，16KB 训练字典使输出反而 **大 12~14%**
+  （LP 格式规整，zstd 帧内前 ~1KB 即自学习收敛，静态字典反而与自适应窗口竞争）；
+  仅 <1KB 小帧有 ~16% 增益，绝对收益可忽略。压缩瓶颈已不在链路，不必引入
+  字典分发/版本复杂度。
+
+### 5.3 订阅侧参数（源库 influxdb.conf `[subscriber]`，快路径相关）
+
+| 参数 | 默认 | 建议 | 说明 |
+|---|---|---|---|
+| `write-buffer-size` | 1000 | 1000~5000 | 推送批次点数上限 |
+| `flush-interval` | 1s | 100~200ms | **快路径延迟地板**；越小越实时 |
+| `http-timeout` | 30s | 30s | 推送 HTTP 超时 |
+
+推送帧大小 ≈ `min(buffer, 写入率 × flush-interval)`：
+
+- 写入率高（≥ buffer/flush-interval）→ 按 buffer 触发，帧 = buffer 点数（压缩率正常）；
+- 写入率低 → 按 flush-interval 触发，产生小帧（压缩率低，但绝对流量小，无碍）。
+- 例：flush-interval=200ms + buffer=1000 → 写入率 ≥5000 点/s 时帧恒为 1000 点。
+
+### 5.4 其余参数
+
+- **延迟敏感**：轮询路径 watermark=2s（e2e ~2.5s）；**安全优先**：watermark=5s+；
+  要亚秒级请启用快路径（`fast_path.listen`，见 docs/a4-fast-path.md）——
+  实测快路径所有档位 e2e 0~1s，负载越高相对优势越大。
+- **吞吐**：query_limit 大→分页少；poller_parallel 4 适合 20 万点/s；
+  源库写入能力是 15 万+ 的常见瓶颈（实测容器环境 ~8~12 万点/s）。
 - **多实例**：每实例独立 WAL 目录 / last_seq / DLQ / monitor 端口 / 日志文件——
   共用会损坏数据
 - **InfluxDB 侧**（128G 内存环境）：tsi1 索引、max-values-per-tag=0、cache-max-memory=20g、
@@ -161,9 +213,14 @@ query_limit=500000、poller_parallel=4、WAL 64MB、monitor :28080。
 | sync.query_limit | 100000 | 单次查询 LIMIT |
 | sync.poller_parallel | 4（≤1 视为 4） | 并行 worker 数 |
 | sync.signal_min_interval | 200ms | 信号最小间隔 |
+| sync.fast_path.listen | 空（禁用） | A4 快路径监听（V1.5） |
+| sync.fast_path.mode | auto | off=仅信号 / auto=游标追平自动启用 / on=强制 |
+| sync.fast_path.activate_age / deactivate_age | watermark+3s / 30s | 自动启用/退避阈值（迟滞） |
+| sync.fast_path.dedup_window | watermark+5s | 快路径→轮询去重集保留窗口 |
 | sync.backfill | 0 | 首次回填 |
 | wal.segment_size | 64MB | 段大小 |
 | tcp.timeout / dial_timeout | 10s | sender TCP 读写/拨号 |
+| tcp.compression | zstd | 帧压缩：zstd（V1.6 默认）/ gzip（兼容旧接收端） |
 | tcp.read_timeout | 60s | receiver 读帧超时 |
 | tcp.max_inflight | 8（≤0 视为 8） | receiver 并发写库窗口 |
 | tcp.max_conns | 0（不限制） | receiver 最大连接数 |

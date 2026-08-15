@@ -1,6 +1,6 @@
 # 部署手册
 
-> V1.4.3。安装包：`influx-sync-v1.4.3-linux-amd64.tar.gz`。
+> V1.6.0（A4 订阅快路径 + zstd 压缩）。安装包：`influx-sync-v1.6.0-linux-amd64.tar.gz`。
 > 配置说明见 [configuration.md](configuration.md)；协议见 [protocol.md](protocol.md)。
 
 ## 1. 安装布局
@@ -8,7 +8,7 @@
 ```
 /opt/influx-sync/
 ├── bin/
-│   ├── sender            # V1.4.3 静态二进制（CGO_ENABLED=0，兼容麒麟 V10 glibc 2.28）
+│   ├── sender            # V1.6.0 静态二进制（CGO_ENABLED=0，兼容麒麟 V10 glibc 2.28）
 │   ├── receiver
 │   ├── loadgen           # 压测工具（可选）
 │   └── *.bak             # 历史版本备份（升级前保留；含 <新版本>.bak 双份）
@@ -26,8 +26,8 @@
 
 ```bash
 # 1. 解包并安装
-tar xzf influx-sync-v1.4.3-linux-amd64.tar.gz -C /tmp
-cd /tmp/influx-sync-v1.4.3
+tar xzf influx-sync-v1.6.0-linux-amd64.tar.gz -C /tmp
+cd /tmp/influx-sync-v1.6.0
 ./upgrade.sh --no-restart          # 只安装二进制（首次无服务可重启）
 
 # 2. 目录与服务账号
@@ -49,15 +49,15 @@ systemctl enable --now influx-sync-sender@174
 # 5. 验证
 tail -f /opt/influx-sync/logs/sender-174.log     # "sender started"
 curl -s http://127.0.0.1:28080/metrics | head
-go version -m /opt/influx-sync/bin/sender | grep vcs.revision   # 溯源戳=v1.4.3
+go version -m /opt/influx-sync/bin/sender | grep vcs.revision   # 溯源戳=v1.6.0
 ```
 
 ## 3. 升级
 
 ```bash
 # 安装包脚本升级（推荐）：备份 .bak → 装新二进制 → 重启全部 influx-sync-* 服务
-tar xzf influx-sync-v1.4.3-linux-amd64.tar.gz -C /tmp
-cd /tmp/influx-sync-v1.4.3 && ./upgrade.sh
+tar xzf influx-sync-v1.6.0-linux-amd64.tar.gz -C /tmp
+cd /tmp/influx-sync-v1.6.0 && ./upgrade.sh
 ```
 
 手动升级（等价操作）：
@@ -79,7 +79,7 @@ systemctl restart influx-sync-sender-174
 
 ```bash
 # 麒麟 V10 glibc 2.28 必须静态编译；**先 commit+tag 再构建**，溯源戳才干净
-git tag v1.4.3 && git status --porcelain   # 确保工作树干净
+git tag v1.6.0 && git status --porcelain   # 确保工作树干净
 mkdir -p /tmp/out && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /tmp/out/sender ./cmd/sender
 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /tmp/out/receiver ./cmd/receiver
 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /tmp/out/loadgen ./bench/loadgen
@@ -144,3 +144,26 @@ firewall-cmd --reload
 6. 写入 1 条测试数据 → 171 库 count 验证（用 influx CLI，勿用 curl count 高压 bug）
 7. `sync_delay_seconds` 稳定在 watermark+处理时间；`sync_e2e_delay_seconds` 同步收敛
 8. 滑窗如需开启：先完成 [pipeline-validation.md](pipeline-validation.md) 装置验证
+
+## 9. 参数调优要点（V1.5/V1.6 本机实测，上线前必读）
+
+完整推导见 [configuration.md](configuration.md) §5。生产四步走：
+
+1. **压缩**：`tcp.compression: zstd`（默认）。实测链路带宽 zstd ≈ gzip 的 1/2~1/3
+   （5 万点/s：1.2 vs 2.6Mbps），且 CPU 更低。**不要做字典训练**（≥500 点帧实测
+   反而大 12~14%）。zstd 需两端同版本——**升级时 sender/receiver 一起升**；
+   滚动升级窗口期两端设 gzip。
+2. **batch_points**：高吞吐档位用 30000（帧 ~240KB，停等 RTT 摊销最好；吞吐 =
+   batch/RTT，减半即吞吐减半）；均衡 10000；低写入率 1000~5000。压缩上限
+   （1MB/16MB）实测远够用，超限自动拆批不卡死。
+3. **订阅侧**（源库 `influxdb.conf [subscriber]`）：`flush-interval=100~200ms`
+   （快路径延迟地板，默认 1s 太大）、`write-buffer-size=1000~5000`（推送帧点数；
+   写入率 × flush-interval ≥ buffer 时帧恒为 buffer 点数，压缩率正常）。
+   快路径推送帧大小只受这两个参数影响，**与 batch_points 无关**。
+4. **延迟预期**：轮询路径 e2e ≈ watermark + 1~2s（高压下查询滞后会再涨，
+   实测 10 万/s 时 12~17s）；快路径 e2e 0~1s（所有档位），压测数据见
+   [bench-2026-08.md](bench-2026-08.md)。
+
+防火墙补充：启用快路径时源库订阅需追加 fast_path 目的地（103 的 18097），
+与 signal_listen 同一订阅多 DESTINATIONS（每库仅 1 个 subscription，见
+[a4-fast-path.md](a4-fast-path.md) §6）。
