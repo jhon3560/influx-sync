@@ -184,6 +184,24 @@ func TestQueryInfluxError(t *testing.T) {
 	}
 }
 
+// TestQueryRespTooLarge N15 回归：响应超过上限必须显式报错（可操作提示），
+// 不得静默截断成 unexpected EOF（曾导致轮询无限重试停滞）。
+func TestQueryRespTooLarge(t *testing.T) {
+	old := maxQueryRespBytes
+	maxQueryRespBytes = 1024
+	defer func() { maxQueryRespBytes = old }()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"results":[{"series":[{"name":"m","columns":["time","value"],"values":[`+
+			strings.Repeat(`[0,1.5],`, 200)+`]}]}]}`)
+	}))
+	defer srv.Close()
+	c := newTestClient(t, srv)
+	_, err := c.QueryRange(context.Background(), 0, 100, QueryOptions{})
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("expected truncation error with guidance, got %v", err)
+	}
+}
+
 func TestWriteLines(t *testing.T) {
 	srv, _, writeCount, written := newFakeInflux(t)
 	c := newTestClient(t, srv)

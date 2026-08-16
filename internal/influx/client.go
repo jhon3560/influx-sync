@@ -70,6 +70,10 @@ const (
 	schemaDegradeTTL = 30 * time.Second // 失败降级负缓存（N5：短 TTL 后重试，不永久停摆）
 )
 
+// maxQueryRespBytes 单次查询响应 JSON 上限（N15：64MB 曾静默截断稠密/胖行
+// 查询导致 unexpected EOF 停滞）。var 以便测试注入小上限验证截断检测。
+var maxQueryRespBytes = 512 << 20
+
 // WriteHTTPError 写库 HTTP 错误（带状态码，供错误分类器 typed 判断，
 // 替代解析错误文案）。
 type WriteHTTPError struct {
@@ -319,9 +323,16 @@ func (c *Client) queryOnce(ctx context.Context, start, end int64, opt QueryOptio
 		return nil, fmt.Errorf("influx: query %s [%d,%d): %w", opt.Measurements, start, end, err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	// N15：响应上限 64MB 会静默截断稠密/胖行查询的 JSON（unexpected EOF →
+	// 轮询无限重试停滞）。上限提到 512MB，并显式检测截断给出可操作错误
+	// （配合 query_limit 调低分页大小）。var 以便测试注入小上限。
+	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxQueryRespBytes)+1))
 	if err != nil {
 		return nil, fmt.Errorf("influx: read query response: %w", err)
+	}
+	if len(body) > maxQueryRespBytes {
+		return nil, fmt.Errorf("influx: query response exceeds %dMB (rows too fat/dense; reduce query_limit or max_window)",
+			maxQueryRespBytes>>20)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("influx: query http %d: %s", resp.StatusCode, truncate(string(body), 512))

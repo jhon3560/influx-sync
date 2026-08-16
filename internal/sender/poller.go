@@ -302,6 +302,9 @@ func (p *Poller) pollOnce(ctx context.Context) (blocked bool) {
 	points, err := p.queryParallel(ctx, cursor, end)
 	if err != nil {
 		p.logger.Warn("query failed, keep cursor", zap.Error(err))
+		// N15：查询失败复位窗口增长——下轮回基础窗口（小窗口查询更易成功），
+		// 避免大窗口查询持续失败导致停滞（如响应超限/源库抖动）。
+		p.underfillStreak = 0
 		return false // 保持游标，下轮重试
 	}
 	// N14：欠满计数——空窗或点数 < BatchPoints 的稀疏窗均翻倍跳过；
@@ -356,7 +359,8 @@ func (p *Poller) pollSliced(ctx context.Context, cursor, end int64, blocked bool
 		points, err := p.queryParallel(ctx, s, e)
 		if err != nil {
 			p.logger.Warn("query failed, keep cursor", zap.Error(err))
-			return false // 保持游标，下轮重试
+			p.underfillStreak = 0 // N15：失败复位增长，下轮基础窗口重试
+			return false          // 保持游标，下轮重试
 		}
 		if len(points) > 0 {
 			if p.fastPath != nil {
