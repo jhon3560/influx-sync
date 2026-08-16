@@ -1,7 +1,7 @@
 # 实测部署记录：隔离装置真机同步（2026-08-16）
 
 > 状态：**进行中**。本机 203.0.113.100 → 隔离装置 → 对端 203.0.113.240。
-> 产品：influx-sync V1.7.3（tag v1.7.3，二进制 SHA256 见 SHA256SUMS）。
+> 产品：influx-sync V1.7.5（tag v1.7.5，部署期修复 2 个缺陷，二进制 SHA256 见 SHA256SUMS）。
 > 文档归属：docs/（AGENT.md §6 交接面），由双 AI 互审。
 
 ## 1. 环境
@@ -50,7 +50,7 @@ docker exec sync-src influxd restore -portable -db mhdb_main /backup
 冒烟测试实测捕获（smoketest 游标 08-17T00:00Z 未来值）。单测 mock 编码了错误的
 7 列布局故未拦截，已改真实布局回归。**部署全部改用 V1.7.5 二进制**。
 
-### 3.2 对端：receiver
+### 3.2 对端：receiver（V1.7.3 二进制，协议与 V1.7.5 一致，测试后统一升级）
 
 ```bash
 mkdir -p /opt/influx-sync-test/{bin,logs,data}
@@ -82,10 +82,32 @@ bin/sender -config /home/USER/influx-sync-test/sender.yaml
 |---|---|---|
 | receiver 监听 | `ss -tlnp \| grep 28101` | ✅ pid 85564 |
 | 链路连通 | `nc -vz 203.0.113.101 28101` | ✅ succeeded |
-| 备份恢复 | SHOW DATABASES / COUNT | 进行中（20GB） |
-| 全量回填 | 对端 mhdb_main_sync 计数趋近源 | 待 |
-| 实时模拟 | loadgen 写入 → 观察 sender/receiver 指标 | 待 |
-| （可选）快路径 | 源库 SUBSCRIPTION → sender :18097 | 待 |
+| 备份恢复 | SHOW DATABASES / COUNT | ✅ 21GB，13 分片组（2025-12-15→2026-03-14），measurement：hdb/hdb_test/yctp |
+| 冒烟（28102 副链路） | 2 万点全链路 | ✅ **20000/20000 精确一致**（zstd+停等 ACK 穿装置正常） |
+| 全量回填 | 对端 mhdb_main_sync 计数趋近源 | 🔄 2.7 天/分钟（稠密数据），ETA ~30 分钟 |
+| 实时模拟（快路径） | loadgen 3000 点/s × 5min + SUBSCRIPTION→:18097 | ✅ **端到端 <1s**（对端最新点时间戳=写入时刻 ±1ms；93k 点/31s） |
+| 订阅清洗 | 恢复备份携带原厂死订阅 | ✅ 已 DROP `mhdb_main_to_redis`（指向 203.0.113.1 原网络） |
+
+### 4.1 关键实测数据（快路径）
+
+- 订阅：`CREATE SUBSCRIPTION sync_fast ON mhdb_main.autogen DESTINATIONS ALL 'http://172.17.0.1:18097'`
+  （docker 源库 → WSL 宿主 sender 快路径；[subscriber] flush-interval 默认 1s = 延迟地板）
+- 实测：loadgen 写入 3000 点/s，对端 `SELECT LAST(value)` 时间戳与 UTC 当前时刻差 **<1s**。
+- 回填与快路径并行互不阻塞：游标在 2025-12 历史区时，telemetry 实时点已在对端出现。
+
+### 4.2 坑 6（备份元数据携带订阅）
+
+portable 恢复会把**原厂的 SUBSCRIPTION 元数据一并带过来**（mhdb_main_to_redis →
+http://203.0.113.1:80/apis/influx/subscription），恢复后的 influxd 会向原网络推送
+（本环境不可达，重试刷日志）。恢复后务必 `SHOW SUBSCRIPTIONS` 检查清理。
+
+### 4.3 性能观察（P2，建议项）
+
+- 真空区跳跃：空窗窗口翻倍（5s→…→1h）但按 MaxWindow(30s) 切片逐查，实测吞吐
+  ~1.2h/min（influxd 空闲时更快）。稠密数据回填不受影响；**稀疏库**（如按小时零星
+  上报的库）全量回填会明显变慢，可考虑空片探测加大切片（数据片仍限 30s 保内存）。
+- 停等链路（pipeline_window=1）实测 ~11MB/s 原始（~1.1MB/s 压缩后）。如需更快，
+  经装置确认后可尝试 pipeline_window>1 滑窗。
 
 ## 5. 收尾/恢复对端（测试完成后执行）
 
