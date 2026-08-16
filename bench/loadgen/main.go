@@ -46,6 +46,8 @@ func main() {
 	}
 
 	ch := make(chan []string, (*workers)*2)
+	done := make(chan struct{}) // 任一 worker 失败退出后关闭，防主循环永久阻塞
+	var doneOnce sync.Once
 	var wg sync.WaitGroup
 	var writeErr atomic.Value
 	for i := 0; i < *workers; i++ {
@@ -56,6 +58,7 @@ func main() {
 			for lines := range ch {
 				if err := client.WriteLines(ctx, lines); err != nil {
 					writeErr.Store(err)
+					doneOnce.Do(func() { close(done) })
 					return
 				}
 			}
@@ -76,6 +79,7 @@ func main() {
 	deadline := time.Now().Add(time.Duration(*duration) * time.Second)
 	lastTotal := int64(0)
 
+send:
 	for now := range ticker.C {
 		// 每秒生成一批：时间戳在秒内均匀铺开（每点独立纳秒，模拟真实采集）
 		secStart := now.Truncate(time.Second).UnixNano()
@@ -96,7 +100,12 @@ func main() {
 				lines = append(lines, fmt.Sprintf("%s value=%f,quality=1i %d", tpl, val, ts))
 			}
 			total.Add(int64(len(lines)))
-			ch <- lines // 阻塞发送：worker 慢时自然背压
+			// worker 失败退出时停止发送（否则无消费者，阻塞永久挂起）
+			select {
+			case ch <- lines:
+			case <-done:
+				break send
+			}
 		}
 		// 每秒统计
 		cur := total.Load()
