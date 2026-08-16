@@ -752,7 +752,8 @@ func (c *Client) ProbeOldestData(ctx context.Context) (int64, error) {
 }
 
 // oldestByShards 用 SHOW SHARD GROUPS 的 start_time 最小值定位最早数据。
-// 行结构：id, database, retention_policy, shard_group, start_time, end_time, expiry_time。
+// 真实列布局（InfluxDB 1.8 实测）：id, database, retention_policy,
+// start_time, end_time, expiry_time —— 无 shard_group 列（N12 修复）。
 func (c *Client) oldestByShards(ctx context.Context) (int64, error) {
 	rows, err := c.queryMeta(ctx, `SHOW SHARD GROUPS`)
 	if err != nil {
@@ -760,13 +761,13 @@ func (c *Client) oldestByShards(ctx context.Context) (int64, error) {
 	}
 	var oldest int64
 	for _, row := range rows {
-		if len(row) < 5 {
+		if len(row) < 4 {
 			continue
 		}
 		if db, ok := row[1].(string); !ok || db != c.cfg.Database {
 			continue
 		}
-		s, ok := row[4].(string)
+		s, ok := row[3].(string) // start_time
 		if !ok {
 			continue
 		}

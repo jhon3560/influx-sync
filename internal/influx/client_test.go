@@ -517,15 +517,18 @@ func TestSchemaReuseLastGoodOnMetaFailure(t *testing.T) {
 }
 
 // TestProbeOldestDataByShards SHOW SHARD GROUPS 路径：取本库最早 start_time。
+// mock 用 InfluxDB 1.8 真实 6 列布局（无 shard_group 列）——N12 回归：
+// 曾按 7 列假设取 row[4]=end_time，回填游标落在最老分片组的结束时间，
+// 丢失最老一段数据；单分片组库（smoketest）游标直接落在未来，完全不同步。
 func TestProbeOldestDataByShards(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query().Get("q")
 		if strings.HasPrefix(q, "SHOW SHARD GROUPS") {
-			// 两个分片组：最早 2026-08-01T00:00:00Z
-			fmt.Fprint(w, `{"results":[{"series":[{"name":"power","columns":["id","database","retention_policy","shard_group","start_time","end_time","expiry_time"],
-			"values":[[1,"power","autogen",1,"2026-08-08T00:00:00Z","2026-08-15T00:00:00Z","2026-08-22T00:00:00Z"],
-			          [2,"power","autogen",2,"2026-08-01T00:00:00Z","2026-08-08T00:00:00Z","2026-08-15T00:00:00Z"],
-			          [3,"other","autogen",3,"2020-01-01T00:00:00Z","2020-01-02T00:00:00Z","2020-01-09T00:00:00Z"]]}]}]}`)
+			// 两个分片组：最早 start_time=2026-08-01T00:00:00Z
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"power","columns":["id","database","retention_policy","start_time","end_time","expiry_time"],
+			"values":[[1,"power","autogen","2026-08-08T00:00:00Z","2026-08-15T00:00:00Z","2026-08-22T00:00:00Z"],
+			          [2,"power","autogen","2026-08-01T00:00:00Z","2026-08-08T00:00:00Z","2026-08-15T00:00:00Z"],
+			          [3,"other","autogen","2020-01-01T00:00:00Z","2020-01-02T00:00:00Z","2020-01-09T00:00:00Z"]]}]}]}`)
 			return
 		}
 		http.NotFound(w, r)
@@ -547,7 +550,7 @@ func TestProbeOldestDataEmptyFallback(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query().Get("q")
 		if strings.HasPrefix(q, "SHOW SHARD GROUPS") {
-			fmt.Fprint(w, `{"results":[{"series":[{"name":"power","columns":["id","database","retention_policy","shard_group","start_time","end_time","expiry_time"],"values":[]}]}]}`)
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"power","columns":["id","database","retention_policy","start_time","end_time","expiry_time"],"values":[]}]}]}`)
 			return
 		}
 		// count 查询恒 0（空库）
