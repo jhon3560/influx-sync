@@ -23,13 +23,13 @@ import (
 
 // PollerConfig 轮询配置。
 type PollerConfig struct {
-	Interval          time.Duration // 轮询周期，默认 1s
-	Window            time.Duration // 查询窗口，默认 5s
-	Watermark         time.Duration // 水位延迟，默认 10s
-	MaxWindow         time.Duration // 单次查询窗口上限（防时间跳变），默认 30s
-	BatchPoints       int           // 单帧点数，默认 10000
-	WindowTarget      int           // N16 窗口增长目标点数（默认=BatchPoints）：欠满判定阈值，
-	                               // 与帧大小解耦——胖行库帧小（937）而窗口应按大数据量目标增长
+	Interval     time.Duration // 轮询周期，默认 1s
+	Window       time.Duration // 查询窗口，默认 5s
+	Watermark    time.Duration // 水位延迟，默认 10s
+	MaxWindow    time.Duration // 单次查询窗口上限（防时间跳变），默认 30s
+	BatchPoints  int           // 单帧点数，默认 10000
+	WindowTarget int           // N16 窗口增长目标点数（默认=BatchPoints）：欠满判定阈值，
+	// 与帧大小解耦——胖行库帧小（937）而窗口应按大数据量目标增长
 	QueryLimit        int           // 单次查询 LIMIT（越大分页越少，扫描开销越低），默认 100000
 	ParallelQueries   int           // 多窗口并行查询/组帧 worker 数，默认 4（0/1=串行）
 	MinSignalInterval time.Duration // 订阅信号最小查询间隔（防高频信号打满 Poller），默认 200ms
