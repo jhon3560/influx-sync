@@ -41,8 +41,14 @@ docker exec sync-src influxd restore -portable -db mhdb_main /backup
 **坑 2**：restore 容器必须同时挂数据卷与备份目录（首次忘挂 /backup）。
 **坑 3**（V1.7.3 缺陷，已修 V1.7.4）：`backfill: all` 被 `Validate()` 误入通用 duration
 校验表报 `bad duration "all"`——文档默认值无法通过配置校验，专门处理 all/0 的代码成死代码。
-修复见 commit（V1.7.4），部署改用 V1.7.4 二进制。
 **坑 4**：receiver **不会自动建目标库**，须先在目标 influx 手动 `CREATE DATABASE`。
+**坑 5**（V1.7.3 缺陷，已修 V1.7.5，N12）：`ProbeOldestData` 按 7 列假设取
+`SHOW SHARD GROUPS` 的 `row[4]`，但 InfluxDB 1.8 真实为 6 列（无 shard_group 列），
+`row[4]` 实为 **end_time**：
+- 单分片组库（当前组未闭合）→ 游标=end_time 落在**未来** → 完全不发数据；
+- 多分片组库 → 游标=最老组结束时间 → **最老一段数据静默丢失**（mhdb_main 会丢 2025-12-15→12-22 一周）。
+冒烟测试实测捕获（smoketest 游标 08-17T00:00Z 未来值）。单测 mock 编码了错误的
+7 列布局故未拦截，已改真实布局回归。**部署全部改用 V1.7.5 二进制**。
 
 ### 3.2 对端：receiver
 
@@ -56,7 +62,7 @@ nohup /opt/influx-sync-test/bin/receiver -config /opt/influx-sync-test/receiver.
 关键配置：`target.database: mhdb_main_sync`、`tcp.listen: :28101`、
 `dedup.last_seq_file: /opt/influx-sync-test/data/last_seq`、认证 root/SECRET_REDACTED。
 
-### 3.3 本机：sender
+### 3.3 本机：sender（V1.7.5 二进制）
 
 ```bash
 bin/sender -config /home/USER/influx-sync-test/sender.yaml
@@ -64,6 +70,11 @@ bin/sender -config /home/USER/influx-sync-test/sender.yaml
 
 关键配置：`source=http://127.0.0.1:18086, database=mhdb_main`、
 `tcp.addr=203.0.113.101:28101`、`backfill=all`、`compression=zstd`（默认）。
+
+### 3.4 冒烟测试（28102 副链路，先行验证）
+
+小库 `smoketest`（loadgen 2 万点）→ receiver-smoke → 对端 `mhdb_sync_smoke`。
+目的：在大库回填前验证协议/装置层全链路。过程中捕获坑 3/坑 5 两个缺陷并修复。
 
 ## 4. 验证计划
 
