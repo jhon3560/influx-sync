@@ -57,8 +57,8 @@ const (
 type fastDedup struct {
 	mu        sync.Mutex
 	series    map[string]uint64
-	idName    []string         // id -> series 名（逆向查找，驱逐清理用）
-	idRefs    map[uint64]int   // id -> 活跃条目引用计数（R1：最后一个条目驱逐时惰性清理 series）
+	idName    []string       // id -> series 名（逆向查找，驱逐清理用）
+	idRefs    map[uint64]int // id -> 活跃条目引用计数（R1：最后一个条目驱逐时惰性清理 series）
 	nextID    uint64
 	parts     map[int64]map[uint64]struct{} // 秒 -> packed(id, offset)
 	retention time.Duration

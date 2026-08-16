@@ -1,7 +1,8 @@
 // linkproxy: TCP 字节计数代理。
 // 用法: linkproxy -listen :28081 -target 127.0.0.1:28101 -metrics :28091
-//   正向流量（listen→target）计入 tx_bytes_total，反向（target→listen）计入 rx_bytes_total。
-//   每连接一个 goroutine 转发，计数器线程安全；/metrics 输出文本格式供采样。
+//
+//	正向流量（listen→target）计入 tx_bytes_total，反向（target→listen）计入 rx_bytes_total。
+//	每连接一个 goroutine 转发，计数器线程安全；/metrics 输出文本格式供采样。
 package main
 
 import (

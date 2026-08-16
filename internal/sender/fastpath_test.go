@@ -388,8 +388,8 @@ func TestFastDedupSeriesRefcountKeepsActive(t *testing.T) {
 	d := newFastDedup(15 * time.Second)
 	now := time.Now().UnixNano()
 	d.Add("m|s=1|", now-20*int64(time.Second)) // 旧分区（超出 retention）
-	d.Add("m|s=1|", now)                        // 新分区（同 series）
-	d.SetCursor(now)                            // 游标推进：驱逐旧分区（cut=now-retention 之前）
+	d.Add("m|s=1|", now)                       // 新分区（同 series）
+	d.SetCursor(now)                           // 游标推进：驱逐旧分区（cut=now-retention 之前）
 	d.mu.Lock()
 	_, ok := d.series["m|s=1|"]
 	d.mu.Unlock()
