@@ -28,6 +28,8 @@ type PollerConfig struct {
 	Watermark         time.Duration // 水位延迟，默认 10s
 	MaxWindow         time.Duration // 单次查询窗口上限（防时间跳变），默认 30s
 	BatchPoints       int           // 单帧点数，默认 10000
+	WindowTarget      int           // N16 窗口增长目标点数（默认=BatchPoints）：欠满判定阈值，
+	                               // 与帧大小解耦——胖行库帧小（937）而窗口应按大数据量目标增长
 	QueryLimit        int           // 单次查询 LIMIT（越大分页越少，扫描开销越低），默认 100000
 	ParallelQueries   int           // 多窗口并行查询/组帧 worker 数，默认 4（0/1=串行）
 	MinSignalInterval time.Duration // 订阅信号最小查询间隔（防高频信号打满 Poller），默认 200ms
@@ -72,14 +74,32 @@ type Poller struct {
 	wakeupScheduled atomic.Bool   // watermark 解锁自唤醒定时器是否已安排（原子，防竞态）
 
 	fastPath *FastPath // A4 快路径（nil=未启用）；查询归并后过滤已转发点
-	// underfillStreak 连续"欠满窗口"计数（N14）：空窗或点数 < BatchPoints 的
+	// underfillStreak 连续"欠满窗口"计数（N14）：空窗或点数 < 增长目标 的
 	// 稀疏窗都计入，驱动窗口翻倍（5s→…→1h 上限）——稀疏库回填不再被
-	// 5s/迭代 封顶；命中稠密数据（≥ BatchPoints）复位。
+	// 5s/迭代 封顶；命中稠密数据（≥ 增长目标）复位。
 	underfillStreak int
+	// prefetch 单窗口轮次的下窗口预取（N16）：处理本轮结果时下一轮查询在途，
+	// 隐藏源库查询延迟（实测 ~1.8s/轮）。仅单窗口路径启用；切片路径查询便宜
+	// 无需预取。仅 Run 循环 goroutine 访问，无竞态。
+	prefetch *prefetchSlot
+}
+
+// prefetchSlot 在途预取查询。consume 时若 cursor 与当前游标不符
+// （上一轮处理失败游标未推进等），丢弃并同步重查——防御性兜底零丢失。
+type prefetchSlot struct {
+	cursor, end int64
+	blocked     bool // 窗口被水位截断（供消费轮透传，驱动解锁自唤醒）
+	ch          chan prefetchResult
+}
+
+// prefetchResult 预取查询结果。
+type prefetchResult struct {
+	points []model.Point
+	err    error
 }
 
 // emptySkipMaxWindow 空窗/欠满窗自适应跳过的窗口上限：按 5s→10s→…→1h 翻倍，
-// 命中稠密数据（≥ BatchPoints）即复位。正常数据窗口仍受 MaxWindow(30s) 约束
+// 命中稠密数据（≥ 增长目标）即复位。正常数据窗口仍受 MaxWindow(30s) 约束
 // （见 pollOnce/pollSliced）。
 const emptySkipMaxWindow = time.Hour
 
@@ -98,6 +118,15 @@ func (p *Poller) windowSize() time.Duration {
 		w = emptySkipMaxWindow
 	}
 	return w
+}
+
+// windowTarget 窗口增长目标点数（N16）：欠满判定阈值，与帧大小（BatchPoints）
+// 解耦。未配置时沿用 BatchPoints（旧行为）。
+func (p *Poller) windowTarget() int {
+	if p.cfg.WindowTarget > 0 {
+		return p.cfg.WindowTarget
+	}
+	return p.cfg.BatchPoints
 }
 
 // NewPoller 创建轮询器。
@@ -120,8 +149,8 @@ func NewPoller(client *influx.Client, w *wal.WAL, metrics *monitor.Metrics, logg
 	if cfg.QueryLimit <= 0 {
 		cfg.QueryLimit = 100000
 	}
-	if cfg.ParallelQueries <= 1 {
-		cfg.ParallelQueries = 4
+	if cfg.ParallelQueries <= 0 {
+		cfg.ParallelQueries = 4 // 默认并行；显式 1 保持串行（与配置注释一致）
 	}
 	if cfg.MinSignalInterval <= 0 {
 		cfg.MinSignalInterval = 200 * time.Millisecond
@@ -299,7 +328,28 @@ func (p *Poller) pollOnce(ctx context.Context) (blocked bool) {
 		return p.pollSliced(ctx, cursor, end, blocked)
 	}
 
-	points, err := p.queryParallel(ctx, cursor, end)
+	// N16：优先消费预取结果（处理本轮时上一轮已把查询发出去）。
+	// 消费轮**直接采用槽的窗口边界**（streak 每轮变化，重算必然失配）；
+	// 仅当槽游标与当前游标不符（上一轮处理失败未推进）时丢弃同步重查
+	// ——零丢失兜底。
+	var points []model.Point
+	var err error
+	if p.prefetch != nil {
+		slot := p.prefetch
+		p.prefetch = nil
+		if slot.cursor == cursor {
+			end = slot.end
+			blocked = slot.blocked
+			r := <-slot.ch
+			points, err = r.points, r.err
+		} else {
+			p.logger.Debug("prefetch discarded (cursor mismatch), re-query",
+				zap.Int64("slot_cursor", slot.cursor), zap.Int64("cursor", cursor))
+			points, err = p.queryParallel(ctx, cursor, end)
+		}
+	} else {
+		points, err = p.queryParallel(ctx, cursor, end)
+	}
 	if err != nil {
 		p.logger.Warn("query failed, keep cursor", zap.Error(err))
 		// N15：查询失败复位窗口增长——下轮回基础窗口（小窗口查询更易成功），
@@ -307,9 +357,13 @@ func (p *Poller) pollOnce(ctx context.Context) (blocked bool) {
 		p.underfillStreak = 0
 		return false // 保持游标，下轮重试
 	}
-	// N14：欠满计数——空窗或点数 < BatchPoints 的稀疏窗均翻倍跳过；
-	// 命中稠密数据（≥ BatchPoints）复位。
-	if len(points) < p.cfg.BatchPoints {
+
+	// N16：立即启动下一窗口预取（与下方处理并行，隐藏源库查询延迟）。
+	p.launchPrefetch(ctx, end)
+
+	// N14：欠满计数——空窗或点数 < 增长目标的稀疏窗均翻倍跳过；
+	// 命中稠密数据（≥ 增长目标）复位。
+	if len(points) < p.windowTarget() {
 		p.underfillStreak++
 	} else {
 		p.underfillStreak = 0
@@ -330,10 +384,12 @@ func (p *Poller) pollOnce(ctx context.Context) (blocked bool) {
 	// 先写 WAL，成功后才推进游标（顺序铁律，违反会漏数据）
 	if err := p.appendFrames(points); err != nil {
 		p.logger.Error("wal append failed, keep cursor", zap.Error(err))
+		p.prefetch = nil // 游标未推进，预取结果作废（consume 时兜底再查）
 		return false
 	}
 	if err := p.wal.SetCursor(end); err != nil {
 		p.logger.Error("cursor update failed", zap.Error(err))
+		p.prefetch = nil
 		return false
 	}
 	p.metrics.SetCursor(end)
@@ -343,14 +399,44 @@ func (p *Poller) pollOnce(ctx context.Context) (blocked bool) {
 	return blocked
 }
 
+// launchPrefetch 启动 [cursor, cursor+window) 的预取查询（N16）。
+// 仅当下一窗口 ≤ MaxWindow（下轮走单窗口路径）时预取——翻倍窗口走切片
+// 路径（一轮处理整个大窗口），预取反而不划算。仅查询不推进游标；
+// 查询失败由消费轮统一处理（复位增长 + 同步重查），不会丢窗口。
+func (p *Poller) launchPrefetch(ctx context.Context, cursor int64) {
+	if p.prefetch != nil {
+		return // 已有预取在途
+	}
+	nw := p.windowSize()
+	if nw > p.cfg.MaxWindow {
+		return // 下一窗口将走切片路径，不预取
+	}
+	ne := cursor + int64(nw)
+	blocked := false
+	if maxEnd := time.Now().UnixNano() - int64(p.cfg.Watermark); ne > maxEnd {
+		ne = maxEnd
+		blocked = true
+	}
+	if ne <= cursor {
+		return // 已追平水位，无窗口可预取
+	}
+	ch := make(chan prefetchResult, 1)
+	go func() {
+		pts, err := p.queryParallel(ctx, cursor, ne)
+		ch <- prefetchResult{points: pts, err: err}
+	}()
+	p.prefetch = &prefetchSlot{cursor: cursor, end: ne, blocked: blocked, ch: ch}
+}
+
 // pollSliced 翻倍窗口切片扫描（V1.7.1/N14）：在翻倍窗口内按 MaxWindow 逐片查询：
 //   - 空片：直接推进游标（该区间已确认无数据），继续下一片；
-//   - 稀疏片（0<点数<BatchPoints）：正常处理，继续下一片（增长趋势保持）；
-//   - 稠密片（≥BatchPoints）：处理并复位增长计数，返回（下轮回基础窗口）。
+//   - 稀疏片（0<点数<增长目标）：正常处理，继续下一片（增长趋势保持）；
+//   - 稠密片（≥增长目标）：处理并复位增长计数，返回（下轮回基础窗口）。
 //
 // 空片推进游标安全：查询返回空 ⟹ 该区间确实无数据（若快路径已转发该区间
 // 某点，源库必存在该点，查询必返回之，由 Filter 去重）——跳过不丢任何点。
 func (p *Poller) pollSliced(ctx context.Context, cursor, end int64, blocked bool) bool {
+	p.prefetch = nil // 切片路径不消费预取；旧槽由消费轮防御性丢弃
 	for s := cursor; s < end; {
 		e := s + int64(p.cfg.MaxWindow)
 		if e > end {
@@ -367,7 +453,7 @@ func (p *Poller) pollSliced(ctx context.Context, cursor, end int64, blocked bool
 				p.fastPath.SetCursor(s)
 				points = p.fastPath.Filter(points)
 			}
-			if len(points) < p.cfg.BatchPoints {
+			if len(points) < p.windowTarget() {
 				// 稀疏片：处理并继续（欠满计数继续增长）
 				p.logger.Debug("poll slice (sparse)",
 					zap.Int64("start", s), zap.Int64("end", e), zap.Int("points", len(points)))

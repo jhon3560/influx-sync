@@ -300,6 +300,7 @@ func TestBackfillSpecEdgeCases(t *testing.T) {
 			Watermark         string `yaml:"watermark"`
 			MaxWindow         string `yaml:"max_window"`
 			BatchPoints       int    `yaml:"batch_points"`
+			WindowTarget      int    `yaml:"window_target"`
 			QueryLimit        int    `yaml:"query_limit"`
 			ParallelQueries   int    `yaml:"poller_parallel"`
 			SignalListen      string `yaml:"signal_listen"`

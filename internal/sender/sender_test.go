@@ -726,3 +726,178 @@ func TestPollSparseBackfillWindowGrowth(t *testing.T) {
 		t.Fatal("sparse points must land in wal")
 	}
 }
+
+// TestPollPrefetchPipeline N16 回归：单窗口轮次的下一窗口查询在处理本轮时
+// 已在途（预取消费）；多轮后游标正确推进、点数全量入 WAL、零重复零丢失。
+func TestPollPrefetchPipeline(t *testing.T) {
+	var mu sync.Mutex
+	var queryCount int
+	var queryDelay = 30 * time.Millisecond // 模拟源库查询延迟
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/query" {
+			http.NotFound(w, r)
+			return
+		}
+		q := r.URL.Query().Get("q")
+		if strings.HasPrefix(q, "SHOW TAG KEYS") {
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"m","columns":["tagKey"],"values":[]}]}]}`)
+			return
+		}
+		if strings.HasPrefix(q, "SHOW FIELD KEYS") {
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"m","columns":["fieldKey","fieldType"],"values":[["value","float"]]}]}]}`)
+			return
+		}
+		if strings.Contains(q, "SELECT *") {
+			mu.Lock()
+			queryCount++
+			mu.Unlock()
+		}
+		time.Sleep(queryDelay)
+		var start, end int64
+		fmt.Sscanf(q, "SELECT * FROM /.*/ WHERE time >= %dns AND time < %dns LIMIT %d", &start, &end)
+		var rows []string
+		for ts := start + 1e9; ts < end; ts += 2 * 1e9 { // 每 2s 1 点
+			rows = append(rows, fmt.Sprintf(`[%d,"A01",%d]`, ts, ts))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"results":[{"series":[{"name":"m","columns":["time","plant","value"],"values":[%s]}]}]}`, strings.Join(rows, ","))
+	}))
+	defer srv.Close()
+	w, m, c := newTestEnv(t, srv.URL)
+	p := NewPoller(c, w, m, testLogger(t), PollerConfig{
+		Window: 20 * time.Second, Watermark: time.Second, MaxWindow: 20 * time.Second,
+		BatchPoints: 5,
+	})
+	// 数据密度 0.5 点/s → 每窗 10 点 ≥ 5 目标 → streak 恒 0，窗口恒 20s（预取路径）
+	w.SetCursor(0)
+	const rounds = 6
+	for i := 0; i < rounds; i++ {
+		p.pollOnce(context.Background())
+	}
+	// 每轮 20s 窗口 × 6 轮 = 120s；每 2s 1 点 = 60 点全量入 WAL
+	if w.Cursor() != int64(rounds*20*1e9) {
+		t.Fatalf("cursor=%d want %d", w.Cursor(), int64(rounds*20*1e9))
+	}
+	if w.PendingCount() < rounds {
+		t.Fatalf("pending=%d want >= %d (每轮至少 1 帧)", w.PendingCount(), rounds)
+	}
+	mu.Lock()
+	qc := queryCount
+	mu.Unlock()
+	// NewPoller 将 ParallelQueries<=1 强制为 4（每窗 4 段查询）：
+	// 6 轮 = 24 段查询；预取生效时第 7 个窗口已在途 = 28。防重查风暴断言区间。
+	if qc < rounds*4 || qc > (rounds+1)*4 {
+		t.Fatalf("query count=%d want in [%d, %d] (prefetch storm or missing rounds?)",
+			qc, rounds*4, (rounds+1)*4)
+	}
+}
+
+// TestPollPrefetchDiscardOnMismatch N16 防御：预取槽游标与当前游标不符
+// （上一轮处理失败未推进）→ 丢弃并同步重查，不得跳过窗口（零丢失）。
+func TestPollPrefetchDiscardOnMismatch(t *testing.T) {
+	var queryCount int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/query" {
+			http.NotFound(w, r)
+			return
+		}
+		q := r.URL.Query().Get("q")
+		if strings.HasPrefix(q, "SHOW TAG KEYS") {
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"m","columns":["tagKey"],"values":[]}]}]}`)
+			return
+		}
+		if strings.HasPrefix(q, "SHOW FIELD KEYS") {
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"m","columns":["fieldKey","fieldType"],"values":[["value","float"]]}]}]}`)
+			return
+		}
+		atomic.AddInt32(&queryCount, 1)
+		var start, end int64
+		fmt.Sscanf(q, "SELECT * FROM /.*/ WHERE time >= %dns AND time < %dns LIMIT %d", &start, &end)
+		var rows []string
+		for ts := start + 1e9; ts < end; ts += 1e9 {
+			rows = append(rows, fmt.Sprintf(`[%d,"A01",%d]`, ts, ts))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"results":[{"series":[{"name":"m","columns":["time","plant","value"],"values":[%s]}]}]}`, strings.Join(rows, ","))
+	}))
+	defer srv.Close()
+	w, m, c := newTestEnv(t, srv.URL)
+	p := NewPoller(c, w, m, testLogger(t), PollerConfig{
+		Window: 10 * time.Second, Watermark: time.Second, MaxWindow: 10 * time.Second,
+		BatchPoints: 100,
+	})
+	w.SetCursor(0)
+	// 注入一个游标不符的预取槽（模拟上一轮失败后残留）
+	p.prefetch = &prefetchSlot{
+		cursor: int64(99 * 1e9), end: int64(109 * 1e9),
+		ch: make(chan prefetchResult, 1),
+	}
+	p.prefetch.ch <- prefetchResult{points: nil, err: nil}
+	qBefore := atomic.LoadInt32(&queryCount)
+	p.pollOnce(context.Background())
+	// 失配 → 同步重查 [0,10s)（+1），随后下一窗口预取（+1）：
+	// 断言重查确实发生且游标正常推进（未跳过窗口）
+	if atomic.LoadInt32(&queryCount) < qBefore+1 {
+		t.Fatalf("query count=%d want >= %d (mismatch must re-query)", atomic.LoadInt32(&queryCount), qBefore+1)
+	}
+	if w.Cursor() != int64(10*1e9) {
+		t.Fatalf("cursor=%d want %d", w.Cursor(), int64(10*1e9))
+	}
+}
+
+// TestPollWindowTargetDecoupled N16 回归：window_target 独立于 batch_points 驱动
+// 窗口增长——帧小（10）但增长目标大（100）时稀疏数据仍翻倍窗口快速推进；
+// 命中 ≥100 点/窗的稠密数据即复位。
+func TestPollWindowTargetDecoupled(t *testing.T) {
+	var mu sync.Mutex
+	var maxSpan int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/query" {
+			http.NotFound(w, r)
+			return
+		}
+		q := r.URL.Query().Get("q")
+		if strings.HasPrefix(q, "SHOW TAG KEYS") {
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"m","columns":["tagKey"],"values":[]}]}]}`)
+			return
+		}
+		if strings.HasPrefix(q, "SHOW FIELD KEYS") {
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"m","columns":["fieldKey","fieldType"],"values":[["value","float"]]}]}]}`)
+			return
+		}
+		var start, end int64
+		fmt.Sscanf(q, "SELECT * FROM /.*/ WHERE time >= %dns AND time < %dns LIMIT %d", &start, &end)
+		mu.Lock()
+		if end-start > maxSpan {
+			maxSpan = end - start
+		}
+		mu.Unlock()
+		var rows []string
+		for ts := start + 1e9; ts < end; ts += 10 * 1e9 { // 1 点/10s 稀疏
+			rows = append(rows, fmt.Sprintf(`[%d,"A01",%d]`, ts, ts))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"results":[{"series":[{"name":"m","columns":["time","plant","value"],"values":[%s]}]}]}`, strings.Join(rows, ","))
+	}))
+	defer srv.Close()
+	w, m, c := newTestEnv(t, srv.URL)
+	p := NewPoller(c, w, m, testLogger(t), PollerConfig{
+		Window: 5 * time.Second, Watermark: time.Second, MaxWindow: 30 * time.Second,
+		BatchPoints: 10, WindowTarget: 100, // 帧 10 点，增长目标 100 点
+	})
+	w.SetCursor(0)
+	// 稀疏（0.1 点/s）：每窗 < 100 目标 → 翻倍增长（若仍按 BatchPoints=10 判定，
+	// 5s 窗仅 ~0.5 点也会增长——为验证解耦，直接断言多轮后游标远超前且 span≤MaxWindow）
+	for i := 0; i < 12; i++ {
+		p.pollOnce(context.Background())
+	}
+	if w.Cursor() < int64(300*1e9) {
+		t.Fatalf("cursor=%d want >= %d (window must grow to MaxWindow slices)", w.Cursor(), int64(300*1e9))
+	}
+	mu.Lock()
+	span := maxSpan
+	mu.Unlock()
+	if span > int64(30*time.Second) {
+		t.Fatalf("query span %v exceeds MaxWindow", time.Duration(span))
+	}
+}

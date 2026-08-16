@@ -51,6 +51,7 @@ type SenderConfig struct {
 		Watermark         string `yaml:"watermark"`           // 水位延迟
 		MaxWindow         string `yaml:"max_window"`          // 窗口上限（防时间跳变）
 		BatchPoints       int    `yaml:"batch_points"`        // 单帧点数
+		WindowTarget      int    `yaml:"window_target"`       // N16 窗口增长目标点数（默认=batch_points）
 		QueryLimit        int    `yaml:"query_limit"`         // 单次查询 LIMIT（分页粒度）
 		ParallelQueries   int    `yaml:"poller_parallel"`     // 多窗口并行查询数（0=串行，默认4）
 		SignalListen      string `yaml:"signal_listen"`       // 订阅信号监听地址（如 ":18098"）；空=纯轮询
@@ -221,6 +222,9 @@ func (c *SenderConfig) Validate() error {
 	if c.Sender.Pipeline < 0 {
 		return fmt.Errorf("config: sender.pipeline_window must be >= 0")
 	}
+	if c.Sync.WindowTarget < 0 {
+		return fmt.Errorf("config: sync.window_target must be >= 0")
+	}
 	if m := c.Sync.FastPath.Mode; m != "" && m != "off" && m != "auto" && m != "on" {
 		return fmt.Errorf("config: sync.fast_path.mode must be off/auto/on, got %q", m)
 	}
@@ -349,6 +353,7 @@ func (c *SenderConfig) PollerConfig() sender.PollerConfig {
 		Watermark:         dur(c.Sync.Watermark, 10*time.Second),
 		MaxWindow:         dur(c.Sync.MaxWindow, 30*time.Second),
 		BatchPoints:       c.Sync.BatchPoints,
+		WindowTarget:      c.Sync.WindowTarget,
 		QueryLimit:        c.Sync.QueryLimit,
 		ParallelQueries:   c.Sync.ParallelQueries,
 		MinSignalInterval: dur(c.Sync.SignalMinInterval, 200*time.Millisecond),

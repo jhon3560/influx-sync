@@ -21,8 +21,12 @@ sync:
   max_window: 30s       # 单轮查询窗口上限（防时间跳变/积压一次拉爆）
   batch_points: 30000   # 单帧点数（原始 30000 点≈2.4MB；压缩后须 ≤1MB）
                         # 若压缩后超限：自动减半拆批；单点仍超限则跳过该点并计数
+  window_target: 30000  # V1.8/N16：窗口增长目标点数（默认=batch_points，欠满判定阈值）
+                        # 胖行库建议：batch_points 调小对准协议上限（如 937），
+                        # window_target 保持大（如 30000）驱动窗口增长——解耦后
+                        # 稠密区窗口不会因帧小而被锁死在基础窗口（5s/轮 × 查询延迟）
   query_limit: 500000   # 单次查询 LIMIT（越大分页越少、扫描开销越低）
-  poller_parallel: 4    # 并行查询/组帧 worker 数（0/1=串行）
+  poller_parallel: 4    # 并行查询/组帧 worker 数（0=默认4/1=串行）
   signal_listen: ":18098"  # 订阅信号监听（源库 SUBSCRIPTION 推送目标）；空=纯轮询
   signal_min_interval: 200ms  # 信号最小查询间隔（V1.4：忙时信号延迟触发而非丢弃）
   fast_path:            # A4 快路径（V1.5）：订阅推送直接透传，端到端延迟降到 <1s
@@ -236,6 +240,7 @@ query_limit=500000、poller_parallel=4、WAL 64MB、monitor :28080。
 | sync.window | 5s | 查询窗口 |
 | sync.watermark | 10s | 水位延迟 |
 | sync.max_window | 30s | 单轮窗口上限 |
+| sync.window_target | batch_points | N16 窗口增长目标点数（欠满判定阈值，与帧大小解耦） |
 | sync.batch_points | 10000 | 单帧点数 |
 | sync.query_limit | 100000 | 单次查询 LIMIT |
 | sync.poller_parallel | 4（≤1 视为 4） | 并行 worker 数 |
