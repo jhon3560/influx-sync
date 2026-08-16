@@ -85,7 +85,7 @@ bin/sender -config /home/USER/influx-sync-test/sender.yaml
 | 链路连通 | `nc -vz 203.0.113.101 28101` | ✅ succeeded |
 | 备份恢复 | SHOW DATABASES / COUNT | ✅ 21GB，13 分片组（2025-12-15→2026-03-14），measurement：hdb/hdb_test/yctp |
 | 冒烟（28102 副链路） | 2 万点全链路 | ✅ **20000/20000 精确一致**（zstd+停等 ACK 穿装置正常） |
-| 全量回填 | 对端 mhdb_main_sync 计数趋近源 | 🔄 V1.7.6/N14 提速后 1.5 天/分钟，ETA ~50 分钟 |
+| 全量回填 | 对端 mhdb_main_sync 计数趋近源 | ⏸ 用户叫停于 2026-01-26（~47%），已同步区间抽验逐位一致；断点可续 |
 | 实时模拟（快路径） | loadgen 3000 点/s × 5min + SUBSCRIPTION→:18097 | ✅ **端到端 <1s**（对端最新点时间戳=写入时刻 ±1ms；93k 点/31s） |
 | 订阅清洗 | 恢复备份携带原厂死订阅 | ✅ 已 DROP `mhdb_main_to_redis`（指向 203.0.113.1 原网络） |
 
