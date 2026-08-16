@@ -72,23 +72,26 @@ type Poller struct {
 	wakeupScheduled atomic.Bool   // watermark 解锁自唤醒定时器是否已安排（原子，防竞态）
 
 	fastPath *FastPath // A4 快路径（nil=未启用）；查询归并后过滤已转发点
-
-	emptyStreak int // 连续空查询窗口计数（V1.7 回填空窗自适应跳过）
+	// underfillStreak 连续"欠满窗口"计数（N14）：空窗或点数 < BatchPoints 的
+	// 稀疏窗都计入，驱动窗口翻倍（5s→…→1h 上限）——稀疏库回填不再被
+	// 5s/迭代 封顶；命中稠密数据（≥ BatchPoints）复位。
+	underfillStreak int
 }
 
-// emptySkipMaxWindow 空窗自适应跳过的窗口上限：真空区按 5s→10s→…→1h 翻倍，
-// 命中数据即复位。正常数据窗口仍受 MaxWindow(30s) 约束（见 pollOnce）。
+// emptySkipMaxWindow 空窗/欠满窗自适应跳过的窗口上限：按 5s→10s→…→1h 翻倍，
+// 命中稠密数据（≥ BatchPoints）即复位。正常数据窗口仍受 MaxWindow(30s) 约束
+// （见 pollOnce/pollSliced）。
 const emptySkipMaxWindow = time.Hour
 
 // SetFastPath 注入快路径转发器（A4；nil 时轮询行为与旧版完全一致）。
 func (p *Poller) SetFastPath(fp *FastPath) { p.fastPath = fp }
 
-// windowSize 计算本轮查询窗口：连续空窗时翻倍（上限 1h），用于快速越过
-// "回拨边界早于库内最早数据"的真空区（正常路径由启动时数据起点探测覆盖，
-// 此处兜底运行期出现真空的情况）。
+// windowSize 计算本轮查询窗口：连续空窗/欠满窗（N14）时翻倍（上限 1h），
+// 用于快速越过"回拨边界早于库内最早数据"的真空区与稀疏数据区
+// （正常路径由启动时数据起点探测覆盖，此处兜底运行期稀疏/真空的情况）。
 func (p *Poller) windowSize() time.Duration {
 	w := p.cfg.Window
-	for i := 0; i < p.emptyStreak && w < emptySkipMaxWindow; i++ {
+	for i := 0; i < p.underfillStreak && w < emptySkipMaxWindow; i++ {
 		w *= 2
 	}
 	if w > emptySkipMaxWindow {
@@ -280,20 +283,20 @@ func (p *Poller) pollOnce(ctx context.Context) (blocked bool) {
 		end = maxEnd
 		blocked = true
 	}
-	// 窗口上限保护：即使时间跳变/积压，单次最多查 MaxWindow（空窗翻倍除外——
-	// 空查询开销小，翻倍上限见 windowSize）
-	if p.emptyStreak == 0 && end-cursor > int64(p.cfg.MaxWindow) {
+	// 窗口上限保护：即使时间跳变/积压，单次最多查 MaxWindow（翻倍窗口除外——
+	// 空/欠满查询开销小，翻倍上限见 windowSize，切片处理见 pollSliced）
+	if p.underfillStreak == 0 && end-cursor > int64(p.cfg.MaxWindow) {
 		end = cursor + int64(p.cfg.MaxWindow)
 	}
 	if end <= cursor {
 		return false // 无新窗口
 	}
 
-	// V1.7.1：空窗翻倍窗口按 MaxWindow 切片扫描——真空区仍快速越过，但**任何
-	// 含数据的切片 ≤ MaxWindow**，单轮内存有界。修复前：连续空窗后首个含数据
-	// 窗口可大到 1h（200k/s 下 7.2 亿点一次性入内存 → OOM）。
-	if p.emptyStreak > 0 && end-cursor > int64(p.cfg.MaxWindow) {
-		return p.pollVacuum(ctx, cursor, end, blocked)
+	// N14/V1.7.1：翻倍窗口按 MaxWindow 切片扫描——真空区/稀疏区仍快速越过，
+	// 但**任何含数据的切片 ≤ MaxWindow**，单轮内存有界。修复前：连续空窗后
+	// 首个含数据窗口可大到 1h（200k/s 下 7.2 亿点一次性入内存 → OOM）。
+	if p.underfillStreak > 0 && end-cursor > int64(p.cfg.MaxWindow) {
+		return p.pollSliced(ctx, cursor, end, blocked)
 	}
 
 	points, err := p.queryParallel(ctx, cursor, end)
@@ -301,11 +304,12 @@ func (p *Poller) pollOnce(ctx context.Context) (blocked bool) {
 		p.logger.Warn("query failed, keep cursor", zap.Error(err))
 		return false // 保持游标，下轮重试
 	}
-	// V1.7：空窗计数——连续空窗翻倍跳过；命中数据复位
-	if len(points) == 0 {
-		p.emptyStreak++
+	// N14：欠满计数——空窗或点数 < BatchPoints 的稀疏窗均翻倍跳过；
+	// 命中稠密数据（≥ BatchPoints）复位。
+	if len(points) < p.cfg.BatchPoints {
+		p.underfillStreak++
 	} else {
-		p.emptyStreak = 0
+		p.underfillStreak = 0
 	}
 	// A4：更新快路径去重集驱逐基准（每轮，无论是否过滤）
 	if p.fastPath != nil {
@@ -336,11 +340,14 @@ func (p *Poller) pollOnce(ctx context.Context) (blocked bool) {
 	return blocked
 }
 
-// pollVacuum 真空区切片扫描（V1.7.1）：在翻倍窗口内按 MaxWindow 逐片查询；
-// 空片直接推进游标（跳过），首个含数据片按正常路径处理并返回。
+// pollSliced 翻倍窗口切片扫描（V1.7.1/N14）：在翻倍窗口内按 MaxWindow 逐片查询：
+//   - 空片：直接推进游标（该区间已确认无数据），继续下一片；
+//   - 稀疏片（0<点数<BatchPoints）：正常处理，继续下一片（增长趋势保持）；
+//   - 稠密片（≥BatchPoints）：处理并复位增长计数，返回（下轮回基础窗口）。
+//
 // 空片推进游标安全：查询返回空 ⟹ 该区间确实无数据（若快路径已转发该区间
 // 某点，源库必存在该点，查询必返回之，由 Filter 去重）——跳过不丢任何点。
-func (p *Poller) pollVacuum(ctx context.Context, cursor, end int64, blocked bool) bool {
+func (p *Poller) pollSliced(ctx context.Context, cursor, end int64, blocked bool) bool {
 	for s := cursor; s < end; {
 		e := s + int64(p.cfg.MaxWindow)
 		if e > end {
@@ -352,13 +359,31 @@ func (p *Poller) pollVacuum(ctx context.Context, cursor, end int64, blocked bool
 			return false // 保持游标，下轮重试
 		}
 		if len(points) > 0 {
-			// 命中数据：过滤快路径已转发点后正常处理，空窗计数复位
-			p.emptyStreak = 0
 			if p.fastPath != nil {
 				p.fastPath.SetCursor(s)
 				points = p.fastPath.Filter(points)
 			}
-			p.logger.Info("poll window (vacuum exit)", zap.Int64("start", s), zap.Int64("end", e), zap.Int("points", len(points)))
+			if len(points) < p.cfg.BatchPoints {
+				// 稀疏片：处理并继续（欠满计数继续增长）
+				p.logger.Debug("poll slice (sparse)",
+					zap.Int64("start", s), zap.Int64("end", e), zap.Int("points", len(points)))
+				if err := p.appendFrames(points); err != nil {
+					p.logger.Error("wal append failed, keep cursor", zap.Error(err))
+					return false
+				}
+				if err := p.wal.SetCursor(e); err != nil {
+					p.logger.Error("cursor update failed", zap.Error(err))
+					return false
+				}
+				p.metrics.SetCursor(e)
+				p.underfillStreak++
+				s = e
+				continue
+			}
+			// 稠密片：处理并复位增长计数，返回
+			p.underfillStreak = 0
+			p.logger.Info("poll window (dense slice)",
+				zap.Int64("start", s), zap.Int64("end", e), zap.Int("points", len(points)))
 			if err := p.appendFrames(points); err != nil {
 				p.logger.Error("wal append failed, keep cursor", zap.Error(err))
 				return false
@@ -373,7 +398,7 @@ func (p *Poller) pollVacuum(ctx context.Context, cursor, end int64, blocked bool
 			return blocked
 		}
 		// 空片：推进游标（该区间已确认无数据），继续下一片
-		p.emptyStreak++
+		p.underfillStreak++
 		if p.fastPath != nil {
 			p.fastPath.SetCursor(s)
 		}

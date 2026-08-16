@@ -642,10 +642,10 @@ func TestPollVacuumSlicedBounded(t *testing.T) {
 	p := NewPoller(c, w, m, testLogger(t), PollerConfig{
 		Window: time.Second, Watermark: time.Second, MaxWindow: 3 * time.Second,
 	})
-	p.emptyStreak = 12 // 连续空窗 → 窗口翻倍到 1h
+	p.underfillStreak = 12 // 连续空窗/欠满 → 窗口翻倍到 1h
 	cur := int64(0)
 	w.SetCursor(cur)
-	// 第一轮：真空切片扫描，空片推进游标到 dataStart 之前，遇数据片处理
+	// 第一轮：切片扫描，空片推进游标到 dataStart 之前，数据片逐片处理（N14 稀疏继续）
 	p.pollOnce(context.Background())
 	mu.Lock()
 	span := maxQuerySpan
@@ -656,8 +656,73 @@ func TestPollVacuumSlicedBounded(t *testing.T) {
 	if w.PendingCount() == 0 {
 		t.Fatal("data slice must land in wal")
 	}
-	// 游标推进且不越过数据区末尾之外（数据片只处理 MaxWindow 一片）
+	// 游标推进且任意切片查询均 ≤ MaxWindow
 	if w.Cursor() <= 0 {
 		t.Fatal("cursor must advance")
+	}
+}
+
+// TestPollSparseBackfillWindowGrowth N14 回归：稀疏数据（点数 << BatchPoints）
+// 的窗口必须与空窗一样翻倍（5s→…→1h）并切片扫描——修复前稀疏库回填速率
+// 被基础窗口封顶（如 6.6 点/s 的库全量回填需十几天）。
+func TestPollSparseBackfillWindowGrowth(t *testing.T) {
+	var mu sync.Mutex
+	var maxQuerySpan int64
+	const dataEnd = int64(3600 * 1e9) // 数据区 [0, 1h)，每 10s 1 点（稀疏）
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/query" {
+			http.NotFound(w, r)
+			return
+		}
+		q := r.URL.Query().Get("q")
+		if strings.HasPrefix(q, "SHOW TAG KEYS") {
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"m","columns":["tagKey"],"values":[]}]}]}`)
+			return
+		}
+		if strings.HasPrefix(q, "SHOW FIELD KEYS") {
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"m","columns":["fieldKey","fieldType"],"values":[["value","float"]]}]}]}`)
+			return
+		}
+		var start, end int64
+		fmt.Sscanf(q, "SELECT * FROM /.*/ WHERE time >= %dns AND time < %dns LIMIT %d", &start, &end)
+		mu.Lock()
+		if end-start > maxQuerySpan {
+			maxQuerySpan = end - start
+		}
+		mu.Unlock()
+		var rows []string
+		for ts := start; ts < end; ts += 10 * 1e9 {
+			if ts < dataEnd {
+				rows = append(rows, fmt.Sprintf(`[%d,"A01",%d]`, ts, ts))
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"results":[{"series":[{"name":"m","columns":["time","plant","value"],"values":[%s]}]}]}`, strings.Join(rows, ","))
+	}))
+	defer srv.Close()
+	w, m, c := newTestEnv(t, srv.URL)
+	p := NewPoller(c, w, m, testLogger(t), PollerConfig{
+		Window: 5 * time.Second, Watermark: time.Second, MaxWindow: 30 * time.Second,
+		BatchPoints: 100,
+	})
+	w.SetCursor(0)
+	for i := 0; i < 10; i++ {
+		p.pollOnce(context.Background())
+		if w.Cursor() >= dataEnd {
+			break
+		}
+	}
+	if w.Cursor() < dataEnd {
+		t.Fatalf("sparse backfill too slow: cursor=%d after 10 iterations (want >= %d, 1h sparse data)",
+			w.Cursor(), dataEnd)
+	}
+	mu.Lock()
+	span := maxQuerySpan
+	mu.Unlock()
+	if span > int64(30*time.Second) {
+		t.Fatalf("query span %v exceeds MaxWindow (memory bound)", time.Duration(span))
+	}
+	if w.PendingCount() == 0 {
+		t.Fatal("sparse points must land in wal")
 	}
 }

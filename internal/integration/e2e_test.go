@@ -433,7 +433,8 @@ func TestEndToEndBackfillAllV17(t *testing.T) {
 		q := r.URL.Query().Get("q")
 		if strings.HasPrefix(q, "SHOW SHARD GROUPS") {
 			st := time.Unix(0, oldest).UTC().Format(time.RFC3339)
-			fmt.Fprintf(w, `{"results":[{"series":[{"name":"power","columns":["id","database","retention_policy","shard_group","start_time","end_time","expiry_time"],"values":[[1,"power","autogen",1,%q,"2026-12-31T00:00:00Z","2027-01-07T00:00:00Z"]]}]}]}`, st)
+			// N12：真实 InfluxDB 1.8 为 6 列布局（无 shard_group 列），row[3]=start_time
+			fmt.Fprintf(w, `{"results":[{"series":[{"name":"power","columns":["id","database","retention_policy","start_time","end_time","expiry_time"],"values":[[1,"power","autogen",%q,"2026-12-31T00:00:00Z","2027-01-07T00:00:00Z"]]}]}]}`, st)
 			return
 		}
 		if strings.HasPrefix(q, "SHOW TAG KEYS") {
