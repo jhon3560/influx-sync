@@ -349,3 +349,57 @@ func TestFastDedupSetCursorEviction(t *testing.T) {
 		t.Fatal("recent entry must remain")
 	}
 }
+
+// TestFastDedupSeriesBounded R1 回归：病态高基数（tag 近似唯一 ID）下 series
+// 映射随条目驱逐惰性清理——最后一个条目被驱逐后 series 名同步回收，不无界增长。
+func TestFastDedupSeriesBounded(t *testing.T) {
+	d := newFastDedup(15 * time.Second)
+	now := time.Now().UnixNano()
+	const n = 10000
+	for i := 0; i < n; i++ {
+		d.Add(fmt.Sprintf("m|id=%d|", i), now)
+	}
+	d.mu.Lock()
+	if len(d.series) != n {
+		t.Fatalf("series=%d, want %d", len(d.series), n)
+	}
+	if len(d.idRefs) != n {
+		t.Fatalf("refs=%d, want %d", len(d.idRefs), n)
+	}
+	// 全部条目驱逐后：series 名必须被惰性清理（R1）
+	d.evictLocked(time.Now().Add(2 * d.retention).UnixNano())
+	left := len(d.series)
+	d.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("series map not cleaned after eviction: %d entries left", left)
+	}
+	if d.Len() != 0 {
+		t.Fatalf("dedup entries=%d, want 0", d.Len())
+	}
+	// 清理后 Contains 正确返回 false（去重退化=重复转发，零丢失语义不变）
+	if d.Contains("m|id=1|", now) {
+		t.Fatal("Contains must be false after cleanup")
+	}
+}
+
+// TestFastDedupSeriesRefcountKeepsActive 引用计数：同 series 跨分区时，驱逐旧分区
+// 不得误删仍有活跃条目的 series。
+func TestFastDedupSeriesRefcountKeepsActive(t *testing.T) {
+	d := newFastDedup(15 * time.Second)
+	now := time.Now().UnixNano()
+	d.Add("m|s=1|", now-20*int64(time.Second)) // 旧分区（超出 retention）
+	d.Add("m|s=1|", now)                        // 新分区（同 series）
+	d.SetCursor(now)                            // 游标推进：驱逐旧分区（cut=now-retention 之前）
+	d.mu.Lock()
+	_, ok := d.series["m|s=1|"]
+	d.mu.Unlock()
+	if !ok {
+		t.Fatal("series must be kept while new partition entry is alive")
+	}
+	if !d.Contains("m|s=1|", now) {
+		t.Fatal("recent entry must remain dedupable")
+	}
+	if d.Contains("m|s=1|", now-20*int64(time.Second)) {
+		t.Fatal("old entry must be evicted")
+	}
+}

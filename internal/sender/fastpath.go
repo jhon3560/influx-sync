@@ -57,6 +57,8 @@ const (
 type fastDedup struct {
 	mu        sync.Mutex
 	series    map[string]uint64
+	idName    []string         // id -> series 名（逆向查找，驱逐清理用）
+	idRefs    map[uint64]int   // id -> 活跃条目引用计数（R1：最后一个条目驱逐时惰性清理 series）
 	nextID    uint64
 	parts     map[int64]map[uint64]struct{} // 秒 -> packed(id, offset)
 	retention time.Duration
@@ -85,12 +87,29 @@ func (d *fastDedup) SetCursor(cursorNs int64) {
 }
 
 // evictLocked 删除 sec < cutSec 的分区（调用方持锁）。
+// R1：驱逐条目时按 ID 引用计数回退，某 series 的最后一个条目被驱逐后
+// 惰性清理其 series 名——病态高基数场景（tag 近似唯一 ID）下 series 映射
+// 也不再无界增长。
 func (d *fastDedup) evictLocked(cutNs int64) {
 	cut := cutNs / int64(time.Second)
-	for sec := range d.parts {
-		if sec < cut {
-			delete(d.parts, sec)
+	for sec, part := range d.parts {
+		if sec >= cut {
+			continue
 		}
+		for packed := range part {
+			id := packed >> 30
+			if n := d.idRefs[id] - 1; n > 0 {
+				d.idRefs[id] = n
+			} else {
+				// 该 series 已无活跃条目：回收 ID 名称映射
+				if int(id) < len(d.idName) && d.idName[id] != "" {
+					delete(d.series, d.idName[id])
+					d.idName[id] = ""
+				}
+				delete(d.idRefs, id)
+			}
+		}
+		delete(d.parts, sec)
 	}
 }
 
@@ -113,6 +132,10 @@ func (d *fastDedup) Add(seriesKey string, ts int64) {
 		id = d.nextID
 		d.nextID++
 		d.series[seriesKey] = id
+		for len(d.idName) <= int(id) {
+			d.idName = append(d.idName, "")
+		}
+		d.idName[id] = seriesKey
 	}
 	sec := ts / int64(time.Second)
 	part := d.parts[sec]
@@ -121,6 +144,10 @@ func (d *fastDedup) Add(seriesKey string, ts int64) {
 		d.parts[sec] = part
 	}
 	part[id<<30|uint64(ts-sec*int64(time.Second))] = struct{}{}
+	if d.idRefs == nil {
+		d.idRefs = make(map[uint64]int)
+	}
+	d.idRefs[id]++
 }
 
 // Contains 查询点是否已由快路径转发。

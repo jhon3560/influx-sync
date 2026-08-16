@@ -198,7 +198,7 @@ func unescape(s []byte) string {
 }
 
 // SeriesKey 规范化 series 标识（measurement + 排序 tags，不含时间戳）。
-// 格式与 Point.Key() 的 measurement|k=v|… 前缀完全一致，保证轮询路径
+// 格式与 Point.Key() 的 len:value 长度前缀一致（V1.7.1 起），保证轮询路径
 // （由 Point 构造）与 fast-path（由 ParseLine 构造）生成相同的去重键。
 func SeriesKey(measurement string, tags map[string]string) string {
 	keys := make([]string, 0, len(tags))
