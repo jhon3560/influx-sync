@@ -112,7 +112,12 @@ http://203.0.113.1:80/apis/influx/subscription），恢复后的 influxd 会向�
   0.96→**8.19 fps（×8.5）**。稠密区收益预计更大（窗口从 5s 锁死解放）。
 - 配置最终态：batch_points=937 + window_target=30000 + query_limit=40000 +
   poller_parallel=8 + pipeline_window=8 + max_window=3600s。
-- 源库（WSL docker）恢复后压缩合并持续与查询争抢 IO；合并结束速率还会自愈。
+- **坑 14（源库调优）**：WSL docker 源库恢复后 8 路压缩合并与查询争抢 IO。
+  已调：`max-concurrent-compactions=2`（让 IO 给 SELECT）、`cache-max-memory-size=4GB`
+  （分页重扫 TSM 少读盘）、`cache-snapshot-memory-size=256MB`、`wal-fsync-delay=100ms`。
+  调优后 0.71→0.76 天/分钟；裸查询回到 ~170ms 低位。生产裸机 influxd 无需
+  （默认合并并发不影响）；**回填类任务建议调低合并并发**。
+- 源库（WSL docker）剩余压缩合并结束速率还会自愈。
 - 停等/滑窗链路：本装置允许多帧在途（pipeline 8 全程 ack_fail=0）。
 
 - **坑 7（V1.7.5 缺陷，已修 V1.7.6，N14）**：恢复的 mhdb_main 是**稀疏库**
