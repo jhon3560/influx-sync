@@ -327,4 +327,12 @@ func TestBackfillSpecEdgeCases(t *testing.T) {
 	if err := sc.Validate(); err == nil || !strings.Contains(err.Error(), "negative") {
 		t.Fatalf("negative backfill must be rejected, got %v", err)
 	}
+	// 回归（部署实测）：backfill=all（默认值）与 "0" 必须通过 Validate
+	// ——all 曾被误入通用 duration 校验表，报 bad duration "all"。
+	for _, v := range []string{"all", "0", "30d", ""} {
+		sc.Sync.Backfill = v
+		if err := sc.Validate(); err != nil {
+			t.Fatalf("backfill %q must pass Validate, got %v", v, err)
+		}
+	}
 }

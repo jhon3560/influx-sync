@@ -39,6 +39,10 @@ docker exec sync-src influxd restore -portable -db mhdb_main /backup
 （经 `127.0.0.1:8088` meta RPC 更新元数据再落 shard），与"先停服务再恢复"的旧认知相反。
 一次性容器里跑会报 `error updating meta: dial tcp [::1]:8088: connection refused`。
 **坑 2**：restore 容器必须同时挂数据卷与备份目录（首次忘挂 /backup）。
+**坑 3**（V1.7.3 缺陷，已修 V1.7.4）：`backfill: all` 被 `Validate()` 误入通用 duration
+校验表报 `bad duration "all"`——文档默认值无法通过配置校验，专门处理 all/0 的代码成死代码。
+修复见 commit（V1.7.4），部署改用 V1.7.4 二进制。
+**坑 4**：receiver **不会自动建目标库**，须先在目标 influx 手动 `CREATE DATABASE`。
 
 ### 3.2 对端：receiver
 

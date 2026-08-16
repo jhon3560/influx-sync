@@ -208,7 +208,6 @@ func (c *SenderConfig) Validate() error {
 		"sync.max_window":             c.Sync.MaxWindow,
 		"sync.signal_min_interval":    c.Sync.SignalMinInterval,
 		"sync.fast_path.dedup_window": c.Sync.FastPath.DedupWindow,
-		"sync.backfill":               c.Sync.Backfill,
 		"tcp.timeout":                 c.TCP.Timeout,
 		"tcp.dial_timeout":            c.TCP.DialTimeout,
 		"sender.backoff_base":         c.Sender.BackoffBase,
