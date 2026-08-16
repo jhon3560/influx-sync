@@ -277,3 +277,54 @@ func TestBackfillSpec(t *testing.T) {
 		}
 	}
 }
+
+// TestBackfillSpecEdgeCases N13 回归：0 时长（"0d"）与负值必须归入"仅实时"，
+// 不得意外落入全量（全库重发）；Validate 显式拒绝负值。
+func TestBackfillSpecEdgeCases(t *testing.T) {
+	cases := []struct {
+		v    string
+		want BackfillMode
+	}{
+		{"", BackfillAll},
+		{"all", BackfillAll},
+		{"0", BackfillNone},
+		{"0s", BackfillNone},
+		{"0d", BackfillNone}, // N13：0 时长=仅实时，非全量
+		{"30d", BackfillDuration},
+		{"1d12h", BackfillDuration},
+	}
+	for _, c := range cases {
+		got := (&SenderConfig{Sync: struct {
+			Interval          string `yaml:"interval"`
+			Window            string `yaml:"window"`
+			Watermark         string `yaml:"watermark"`
+			MaxWindow         string `yaml:"max_window"`
+			BatchPoints       int    `yaml:"batch_points"`
+			QueryLimit        int    `yaml:"query_limit"`
+			ParallelQueries   int    `yaml:"poller_parallel"`
+			SignalListen      string `yaml:"signal_listen"`
+			SignalMinInterval string `yaml:"signal_min_interval"`
+			FastPath          struct {
+				Listen      string `yaml:"listen"`
+				Mode        string `yaml:"mode"`
+				DedupWindow string `yaml:"dedup_window"`
+			} `yaml:"fast_path"`
+			Backfill     string   `yaml:"backfill"`
+			TagColumns   []string `yaml:"tag_columns"`
+			Measurements []string `yaml:"measurements"`
+		}{Backfill: c.v}}).BackfillSpec()
+		if got.Mode != c.want {
+			t.Fatalf("backfill %q: mode=%v want %v", c.v, got.Mode, c.want)
+		}
+	}
+	// Validate 拒绝负值
+	sc := &SenderConfig{}
+	sc.Source.URL = "http://x"
+	sc.Source.Database = "d"
+	sc.TCP.Addr = "1.1.1.1:1"
+	sc.WAL.Path = "/tmp/w"
+	sc.Sync.Backfill = "-5d"
+	if err := sc.Validate(); err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("negative backfill must be rejected, got %v", err)
+	}
+}

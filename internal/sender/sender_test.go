@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -596,5 +597,67 @@ func TestSenderPipelineNackFrameNeverCommitted(t *testing.T) {
 	// 确认没有任何帧被提交：seq=1 卡头，go-back-N 下 2..4 也不得越过提交
 	if s.metrics.AckOkCount() != 0 {
 		t.Fatalf("ack_ok=%d, want 0 (nothing may be committed while head nacks)", s.metrics.AckOkCount())
+	}
+}
+
+// TestPollVacuumSlicedBounded N11 回归：真空区跳过按 MaxWindow 切片——任何含数据
+// 查询 ≤ MaxWindow（修复前连续空窗后首个含数据窗口可达 1h → 200k/s 下 7.2 亿点 OOM）。
+func TestPollVacuumSlicedBounded(t *testing.T) {
+	var mu sync.Mutex
+	var maxQuerySpan int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/query" {
+			http.NotFound(w, r)
+			return
+		}
+		q := r.URL.Query().Get("q")
+		if strings.HasPrefix(q, "SHOW TAG KEYS") {
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"m","columns":["tagKey"],"values":[]}]}]}`)
+			return
+		}
+		if strings.HasPrefix(q, "SHOW FIELD KEYS") {
+			fmt.Fprint(w, `{"results":[{"series":[{"name":"m","columns":["fieldKey","fieldType"],"values":[["value","float"]]}]}]}`)
+			return
+		}
+		var start, end int64
+		fmt.Sscanf(q, "SELECT * FROM /.*/ WHERE time >= %dns AND time < %dns LIMIT %d", &start, &end)
+		mu.Lock()
+		if end-start > maxQuerySpan {
+			maxQuerySpan = end - start
+		}
+		mu.Unlock()
+		var rows []string
+		// 只在 [dataStart, dataStart+1h) 有数据（模拟真空区后的数据恢复）
+		const dataStart = int64(200 * 1e9)
+		for ts := start; ts < end; ts += 1e9 {
+			if ts >= dataStart && ts < dataStart+3600*1e9 {
+				rows = append(rows, fmt.Sprintf(`[%d,"A01",%d]`, ts, ts))
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"results":[{"series":[{"name":"m","columns":["time","plant","value"],"values":[%s]}]}]}`, strings.Join(rows, ","))
+	}))
+	defer srv.Close()
+	w, m, c := newTestEnv(t, srv.URL)
+	p := NewPoller(c, w, m, testLogger(t), PollerConfig{
+		Window: time.Second, Watermark: time.Second, MaxWindow: 3 * time.Second,
+	})
+	p.emptyStreak = 12 // 连续空窗 → 窗口翻倍到 1h
+	cur := int64(0)
+	w.SetCursor(cur)
+	// 第一轮：真空切片扫描，空片推进游标到 dataStart 之前，遇数据片处理
+	p.pollOnce(context.Background())
+	mu.Lock()
+	span := maxQuerySpan
+	mu.Unlock()
+	if span > int64(3*time.Second) {
+		t.Fatalf("query span %v exceeds MaxWindow (N11 OOM regression)", time.Duration(span))
+	}
+	if w.PendingCount() == 0 {
+		t.Fatal("data slice must land in wal")
+	}
+	// 游标推进且不越过数据区末尾之外（数据片只处理 MaxWindow 一片）
+	if w.Cursor() <= 0 {
+		t.Fatal("cursor must advance")
 	}
 }

@@ -75,14 +75,18 @@ func newFastDedup(retention time.Duration) *fastDedup {
 }
 
 // SetCursor 更新驱逐基准（Poller 每轮 poll 调用，值为本轮查询窗口起点）。
+// 基于游标的驱逐是安全的下界优化（ts < cursor-retention 的点 Poller 永不回查）；
+// 真正的内存有界由 Add 中的时间基准驱逐保证（见 evictExpiredLocked 注释）。
 func (d *fastDedup) SetCursor(cursorNs int64) {
-	prev := d.cursorNs.Swap(cursorNs)
-	if prev == cursorNs {
-		return
-	}
+	d.cursorNs.Store(cursorNs)
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	cut := cursorNs/int64(time.Second) - int64(d.retention/time.Second)
+	d.evictLocked(cursorNs - int64(d.retention))
+}
+
+// evictLocked 删除 sec < cutSec 的分区（调用方持锁）。
+func (d *fastDedup) evictLocked(cutNs int64) {
+	cut := cutNs / int64(time.Second)
 	for sec := range d.parts {
 		if sec < cut {
 			delete(d.parts, sec)
@@ -91,9 +95,16 @@ func (d *fastDedup) SetCursor(cursorNs int64) {
 }
 
 // Add 登记一个已转发点（调用方保证 WAL 已成功落盘）。
+// V1.7.1：每次登记同时做**时间基准**驱逐（now-retention 之前的分区删除）。
+// 背景：回填期（backfill=all）游标在历史区慢爬，而快路径持续转发实时点
+// （ts 远超前于游标）——仅靠游标驱逐会导致整个回填期（天级）的条目全部
+// 滞留：200k/s × 24h ≈ 170 亿条目 ≈ TB 级内存，必 OOM。时间基准驱逐把内存
+// 上界钉在 retention×rate（默认 15s×200k ≈ 300 万条）；被提前驱逐的条目
+// 退化方向唯一：重复转发（目标库幂等覆盖），零丢失。
 func (d *fastDedup) Add(seriesKey string, ts int64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.evictLocked(time.Now().UnixNano() - int64(d.retention))
 	id, ok := d.series[seriesKey]
 	if !ok {
 		if d.nextID >= 1<<34 {

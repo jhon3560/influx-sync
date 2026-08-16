@@ -72,24 +72,34 @@ func (p *Point) sortedFieldKeys() []string {
 }
 
 // Key 返回点的唯一标识（measurement+tags+timestamp），用于窗口内查重。
-// 零分配路径：缓存键序 + append 拼装 + strconv（实测由 684ns/7 次分配降到亚 100ns）。
+// 低分配路径：缓存键序 + append 拼装 + strconv。
+// V1.7.1：组件改长度前缀编码（len:value）——旧格式 measurement|k=v|… 在 tag
+// 键/值含 '=' 或 '|' 时存在跨 series 碰撞（如 {a:"x=y"} vs {a=x:"y"}），
+// 碰撞可导致边界去重误删未重复的点（静默丢失）。
 func (p *Point) Key() string {
 	// 预估容量：measurement + tags + 分隔符 + 时间戳
 	n := len(p.Measurement) + 24
 	for k, v := range p.Tags {
-		n += len(k) + len(v) + 2
+		n += len(k) + len(v) + 8
 	}
 	buf := make([]byte, 0, n)
-	buf = append(buf, p.Measurement...)
+	buf = appendLenPrefix(buf, p.Measurement)
 	buf = append(buf, '|')
 	for _, k := range p.sortedTagKeys() {
-		buf = append(buf, k...)
+		buf = appendLenPrefix(buf, k)
 		buf = append(buf, '=')
-		buf = append(buf, p.Tags[k]...)
+		buf = appendLenPrefix(buf, p.Tags[k])
 		buf = append(buf, '|')
 	}
 	buf = strconv.AppendInt(buf, p.Timestamp, 10)
 	return string(buf)
+}
+
+// appendLenPrefix 追加 len:value 组件（长度前缀消除分隔符歧义，键无碰撞）。
+func appendLenPrefix(dst []byte, s string) []byte {
+	dst = strconv.AppendInt(dst, int64(len(s)), 10)
+	dst = append(dst, ':')
+	return append(dst, s...)
 }
 
 // LineProtocol 将点序列化为 InfluxDB Line Protocol 一行。

@@ -152,20 +152,22 @@ func run() error {
 	}
 
 	// V1.5 A4 快路径：配置 fast_path.listen 时启动订阅透传（源库 SUBSCRIPTION 推送
-	// 直接进 WAL/链路；游标追平后自动激活，回填期仅作信号——见 docs/a4-fast-path.md）。
+	// 直接进 WAL/链路；V1.7 起启用即透传，与历史回填并行——见 docs/a4-fast-path.md）。
 	if cfg.Sync.FastPath.Listen != "" {
 		fp := sender.NewFastPath(walInst, metrics, log, cfg.FastPathConfig(),
 			poller.Notify, func() float64 { return sender.WalDiskUsageRatio(walInst.Dir()) })
 		poller.SetFastPath(fp)
-		metrics.SetFastPathState(1) // 初始 waiting（auto 下由游标年龄驱动激活）
 		if fp.Active() {
-			metrics.SetFastPathState(2)
+			metrics.SetFastPathState(2) // 2=透传中（V1.7：启用即 active，无 waiting 态）
+		} else {
+			metrics.SetFastPathState(0) // 0=off（仅信号）
 		}
 		go func() {
 			srv := &http.Server{
 				Addr:              cfg.Sync.FastPath.Listen,
 				Handler:           fp,
 				ReadHeaderTimeout: 5 * time.Second,
+				ReadTimeout:       60 * time.Second, // N16：防慢速 body 占住 goroutine/连接
 			}
 			go func() {
 				<-ctx.Done()

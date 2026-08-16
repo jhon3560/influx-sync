@@ -225,17 +225,17 @@ func SeriesKeyFromPairs(measurement string, tags [][2]string) string {
 }
 
 func appendSeriesKey(measurement string, sortedKeys []string, val func(string) string) string {
-	n := len(measurement) + 1
+	n := len(measurement) + 8
 	for _, k := range sortedKeys {
-		n += len(k) + len(val(k)) + 2
+		n += len(k) + len(val(k)) + 8
 	}
 	buf := make([]byte, 0, n)
-	buf = append(buf, measurement...)
+	buf = appendLenPrefix(buf, measurement)
 	buf = append(buf, '|')
 	for _, k := range sortedKeys {
-		buf = append(buf, k...)
+		buf = appendLenPrefix(buf, k)
 		buf = append(buf, '=')
-		buf = append(buf, val(k)...)
+		buf = appendLenPrefix(buf, val(k))
 		buf = append(buf, '|')
 	}
 	return string(buf)

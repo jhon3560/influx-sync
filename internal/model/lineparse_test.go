@@ -117,3 +117,27 @@ func TestSeriesKeyConsistency(t *testing.T) {
 		t.Fatalf("Key()=%q must start with series key %q", full, keyFromPoint)
 	}
 }
+
+// TestSeriesKeyNoCollision N10 回归：含 '='/'|' 的 tag 键/值不得产生跨 series 碰撞
+// （碰撞会让 fast-path 去重误删未转发点 → 静默丢失；Point.Key 同格式同修）。
+func TestSeriesKeyNoCollision(t *testing.T) {
+	pairs := [][2]map[string]string{
+		{{"a": "x=y"}, {"a=x": "y"}},
+		{{"a": "x", "b": "y"}, {"a": "x|b=y"}},
+		{{"k": "1|2"}, {"k=1|2": ""}},
+		{{"m": "a", "n": "b"}, {"m": "a|n=b"}},
+	}
+	for i, pr := range pairs {
+		k1 := SeriesKey("m", pr[0])
+		k2 := SeriesKey("m", pr[1])
+		if k1 == k2 {
+			t.Fatalf("pair %d COLLISION: %q == %q", i, k1, k2)
+		}
+	}
+	// Point.Key 同格式：同 ts 下不同 series 键必须不同
+	p1 := Point{Measurement: "m", Tags: map[string]string{"a": "x=y"}, Timestamp: 1}
+	p2 := Point{Measurement: "m", Tags: map[string]string{"a=x": "y"}, Timestamp: 1}
+	if p1.Key() == p2.Key() {
+		t.Fatalf("Point.Key COLLISION: %q", p1.Key())
+	}
+}

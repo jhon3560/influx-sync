@@ -57,21 +57,21 @@ type FrameData struct {
 
 // WAL 分段追加写日志。
 type WAL struct {
-	mu        sync.Mutex
-	dir       string
-	dlqDir    string
-	segSize   int64
-	dlqMax    int64
-	cp        checkpoint
-	index     []frameIndex // 按 seg/offset 排序，仅含未确认帧
-	acked     int          // index 中已确认前缀的长度
-	curSeg    int          // 当前写入段序号
-	curFile   *os.File
-	curOffset int64         // 当前写入段内偏移
-	lockFile  *os.File      // 目录锁（防多实例并发）
-	lastCp    time.Time     // 上次 checkpoint 持久化时间（Commit 节流用）
-	notify    chan struct{} // 新增帧通知（cap=1，非阻塞），供 Sender 空闲唤醒
-	legacyCheckpoint bool   // checkpoint 文件为 V1.6 及更早格式（无 backfill_ns）——升级只记录不回拨
+	mu               sync.Mutex
+	dir              string
+	dlqDir           string
+	segSize          int64
+	dlqMax           int64
+	cp               checkpoint
+	index            []frameIndex // 按 seg/offset 排序，仅含未确认帧
+	acked            int          // index 中已确认前缀的长度
+	curSeg           int          // 当前写入段序号
+	curFile          *os.File
+	curOffset        int64         // 当前写入段内偏移
+	lockFile         *os.File      // 目录锁（防多实例并发）
+	lastCp           time.Time     // 上次 checkpoint 持久化时间（Commit 节流用）
+	notify           chan struct{} // 新增帧通知（cap=1，非阻塞），供 Sender 空闲唤醒
+	legacyCheckpoint bool          // checkpoint 文件为 V1.6 及更早格式（无 backfill_ns）——升级只记录不回拨
 }
 
 // Open 打开（或创建）WAL。segSize<=0 时用默认 64MB。
@@ -433,6 +433,9 @@ func (w *WAL) AppendBatch(typ uint8, frameBytes [][]byte) ([]uint64, error) {
 		if len(fb) < protocol.HeaderSize {
 			return nil, fmt.Errorf("wal: frame too short: %d bytes", len(fb))
 		}
+		// N14：索引类型取帧头实际值（fb[3]）——调用方传入的 typ 与帧头不一致时
+		// （如 FastPath/Poller 以 TypeData 传 zstd 帧）索引不产生元数据错位。
+		frameTyp := fb[3]
 		if err := w.ensureSpace(len(fb) + recordHeadLen); err != nil {
 			return nil, err
 		}
@@ -448,7 +451,7 @@ func (w *WAL) AppendBatch(typ uint8, frameBytes [][]byte) ([]uint64, error) {
 			return nil, fmt.Errorf("wal: write frame: %w", err)
 		}
 		w.index = append(w.index, frameIndex{
-			seg: w.curSeg, offset: w.curOffset, length: len(fb), seq: seqs[i], typ: typ,
+			seg: w.curSeg, offset: w.curOffset, length: len(fb), seq: seqs[i], typ: frameTyp,
 		})
 		w.curOffset += recordHeadLen + int64(len(fb))
 		w.cp.NextSeq++

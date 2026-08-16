@@ -781,3 +781,34 @@ func TestApplyBackfillPolicy(t *testing.T) {
 		}
 	})
 }
+
+// TestAppendBatchIndexTypeFromHeader N14 回归：索引 typ 取帧头实际类型
+// （调用方传 TypeData 但帧头是 zstd 0x04 时，索引不产生元数据错位）。
+func TestAppendBatchIndexTypeFromHeader(t *testing.T) {
+	w := newTestWAL(t, 0)
+	fb, err := protocol.Encode(protocol.TypeDataZstd, 0, []byte("m value=1 1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.AppendBatch(protocol.TypeData, [][]byte{fb}); err != nil { // 旧调用方式：传 TypeData
+		t.Fatal(err)
+	}
+	if w.PendingCount() != 1 {
+		t.Fatalf("pending=%d", w.PendingCount())
+	}
+	if got := w.index[0].typ; got != protocol.TypeDataZstd {
+		t.Fatalf("index typ=%d, want %d (zstd, taken from frame header)", got, protocol.TypeDataZstd)
+	}
+	// 帧可完整取出解码（seq 已由 AppendBatch 分配并写入帧头）
+	_, fbOut, err := w.Peek()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := protocol.Decode(fbOut)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if f.Type != protocol.TypeDataZstd || f.Seq != 1 {
+		t.Fatalf("frame type=%d seq=%d", f.Type, f.Seq)
+	}
+}

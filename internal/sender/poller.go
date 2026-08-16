@@ -289,6 +289,13 @@ func (p *Poller) pollOnce(ctx context.Context) (blocked bool) {
 		return false // 无新窗口
 	}
 
+	// V1.7.1：空窗翻倍窗口按 MaxWindow 切片扫描——真空区仍快速越过，但**任何
+	// 含数据的切片 ≤ MaxWindow**，单轮内存有界。修复前：连续空窗后首个含数据
+	// 窗口可大到 1h（200k/s 下 7.2 亿点一次性入内存 → OOM）。
+	if p.emptyStreak > 0 && end-cursor > int64(p.cfg.MaxWindow) {
+		return p.pollVacuum(ctx, cursor, end, blocked)
+	}
+
 	points, err := p.queryParallel(ctx, cursor, end)
 	if err != nil {
 		p.logger.Warn("query failed, keep cursor", zap.Error(err))
@@ -324,6 +331,59 @@ func (p *Poller) pollOnce(ctx context.Context) (blocked bool) {
 	}
 	p.metrics.SetCursor(end)
 	// 每轮刷新 WAL 状态指标（断连积压时可观测）
+	p.metrics.SetWALPending(int64(p.wal.PendingCount()))
+	p.metrics.SetWALBytes(p.wal.DiskUsage())
+	return blocked
+}
+
+// pollVacuum 真空区切片扫描（V1.7.1）：在翻倍窗口内按 MaxWindow 逐片查询；
+// 空片直接推进游标（跳过），首个含数据片按正常路径处理并返回。
+// 空片推进游标安全：查询返回空 ⟹ 该区间确实无数据（若快路径已转发该区间
+// 某点，源库必存在该点，查询必返回之，由 Filter 去重）——跳过不丢任何点。
+func (p *Poller) pollVacuum(ctx context.Context, cursor, end int64, blocked bool) bool {
+	for s := cursor; s < end; {
+		e := s + int64(p.cfg.MaxWindow)
+		if e > end {
+			e = end
+		}
+		points, err := p.queryParallel(ctx, s, e)
+		if err != nil {
+			p.logger.Warn("query failed, keep cursor", zap.Error(err))
+			return false // 保持游标，下轮重试
+		}
+		if len(points) > 0 {
+			// 命中数据：过滤快路径已转发点后正常处理，空窗计数复位
+			p.emptyStreak = 0
+			if p.fastPath != nil {
+				p.fastPath.SetCursor(s)
+				points = p.fastPath.Filter(points)
+			}
+			p.logger.Info("poll window (vacuum exit)", zap.Int64("start", s), zap.Int64("end", e), zap.Int("points", len(points)))
+			if err := p.appendFrames(points); err != nil {
+				p.logger.Error("wal append failed, keep cursor", zap.Error(err))
+				return false
+			}
+			if err := p.wal.SetCursor(e); err != nil {
+				p.logger.Error("cursor update failed", zap.Error(err))
+				return false
+			}
+			p.metrics.SetCursor(e)
+			p.metrics.SetWALPending(int64(p.wal.PendingCount()))
+			p.metrics.SetWALBytes(p.wal.DiskUsage())
+			return blocked
+		}
+		// 空片：推进游标（该区间已确认无数据），继续下一片
+		p.emptyStreak++
+		if p.fastPath != nil {
+			p.fastPath.SetCursor(s)
+		}
+		if err := p.wal.SetCursor(e); err != nil {
+			p.logger.Error("cursor update failed", zap.Error(err))
+			return false
+		}
+		p.metrics.SetCursor(e)
+		s = e
+	}
 	p.metrics.SetWALPending(int64(p.wal.PendingCount()))
 	p.metrics.SetWALBytes(p.wal.DiskUsage())
 	return blocked

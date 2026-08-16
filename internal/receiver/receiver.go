@@ -173,6 +173,7 @@ func (r *Receiver) HandleFrame(connID uint64, frameIdx uint64, frameBytes []byte
 			meta := DLQMeta{
 				SeqNum:        f.Seq,
 				RetryAttempts: 1,
+				FrameType:     f.Type,
 			}
 			meta.ErrorContext.Category = category
 			meta.ErrorContext.HTTPStatus = httpStatus
@@ -211,7 +212,7 @@ func (r *Receiver) HandleFrame(connID uint64, frameIdx uint64, frameBytes []byte
 			// 修复：把 raw lines 落中继专用 DLQ（RelayDLQDir），告警 + 计数。
 			r.logger.Error("relay wal append failed, saving to relay dlq", zap.Uint64("seq", f.Seq), zap.Error(err))
 			if r.cfg.RelayDLQDir != "" {
-				meta := DLQMeta{SeqNum: f.Seq, RetryAttempts: 1}
+				meta := DLQMeta{SeqNum: f.Seq, RetryAttempts: 1, FrameType: f.Type}
 				meta.ErrorContext.Category = "RELAY_FORWARD_FAILURE"
 				meta.ErrorContext.ErrorMessage = err.Error()
 				meta.DataMetadata.SourceZone = "Zone_II"

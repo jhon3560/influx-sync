@@ -31,6 +31,10 @@ type DLQMeta struct {
 		PointCount        int    `json:"point_count"`
 		UncompressedBytes int    `json:"uncompressed_bytes"`
 	} `json:"data_metadata"`
+	// FrameType 原始帧类型（protocol.TypeData=0x01 gzip / TypeDataZstd=0x04 zstd）：
+	// payload_gzip_base64 存的是**该类型压缩后的**原始 payload，重放时必须按此
+	// 类型解压（V1.7.1：修复 zstd 帧存入 gzip 名字段导致的重放歧义）。
+	FrameType         uint8  `json:"frame_type,omitempty"`
 	PayloadGzipBase64 string `json:"payload_gzip_base64"`
 }
 

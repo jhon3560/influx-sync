@@ -27,10 +27,8 @@ sync:
   signal_min_interval: 200ms  # 信号最小查询间隔（V1.4：忙时信号延迟触发而非丢弃）
   fast_path:            # A4 快路径（V1.5）：订阅推送直接透传，端到端延迟降到 <1s
     listen: ":18097"    #   推送监听地址；空=禁用（退化为纯轮询）
-    mode: auto          #   off=仅信号（=旧 signal_listen 行为）/ auto=游标追平自动启用（默认）/ on=强制转发
-    activate_age: 5s    #   auto：cursor 年龄 ≤ 此值启用透传（默认 watermark+3s）
-    deactivate_age: 30s #   auto：年龄 > 此值退回仅信号（迟滞防抖）
-    dedup_window: 15s   #   去重集保留窗口（默认 watermark+5s；驱逐/重启只会造成重复转发，不丢）
+    mode: auto          #   off=仅信号（=旧 signal_listen 行为）/ auto=on=启用即透传（默认；V1.7 不再等追平）
+    dedup_window: 15s   #   去重集保留窗口（默认 watermark+5s；时间基准驱逐，驱逐/重启只会造成重复转发，不丢）
   backfill: all         # V1.7 回填模式：all=全量同步（默认，从库内最早数据开始）/
                         #   0=仅实时（不碰历史）/ 30d=只补最近 30 天（支持 d 单位，1d=24h）
                         #   改配置+重启即生效（只回拨一次游标，不清数据目录）
@@ -244,7 +242,6 @@ query_limit=500000、poller_parallel=4、WAL 64MB、monitor :28080。
 | sync.signal_min_interval | 200ms | 信号最小间隔 |
 | sync.fast_path.listen | 空（禁用） | A4 快路径监听（V1.5） |
 | sync.fast_path.mode | auto | off=仅信号 / auto=游标追平自动启用 / on=强制 |
-| sync.fast_path.activate_age / deactivate_age | watermark+3s / 30s | 自动启用/退避阈值（迟滞） |
 | sync.fast_path.dedup_window | watermark+5s | 快路径→轮询去重集保留窗口 |
 | sync.backfill | all | 回填模式：all=全量（默认）/0=仅实时/Nd=有界回填（d=天） |
 | wal.segment_size | 64MB | 段大小 |

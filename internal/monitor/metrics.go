@@ -231,7 +231,7 @@ relay_dlq_total %d
 # HELP sync_e2e_delay_seconds 端到端延迟（now - 目标库最后写入点时间，0=未知）
 # TYPE sync_e2e_delay_seconds gauge
 sync_e2e_delay_seconds %d
-# HELP fast_path_state 快路径状态 0=off 1=waiting(仅信号) 2=active(透传)
+# HELP fast_path_state 快路径状态 0=off 2=active(透传)（V1.7 起无 waiting 态）
 # TYPE fast_path_state gauge
 fast_path_state %d
 # HELP fast_path_batches_total 快路径收到推送批总数

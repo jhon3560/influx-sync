@@ -54,7 +54,6 @@
   转发"恒成立。
 - 订阅推送不可靠（fire-and-forget，失败即丢）：**丢掉的推送从不登记** → Poller 必然
   补发 → 零丢失。
-- WAITING 期推送不转发也不登记 → 该时段数据全部由 Poller 转发 → 零丢失。
 - ACTIVE 期两路径窗口重叠（快路径覆盖 `[cursor, now]`，Poller 覆盖
   `[cursor, now-watermark)`）→ 重叠区由去重集抑制二次转发；集因驱逐/重启丢失条目只会
   造成**重复转发**（目标库幂等覆盖，计数不重复）——快路径的一切退化方向都是"退化回
@@ -83,9 +82,9 @@
 |---|---|
 | `internal/wal` | `AppendBatch(typ, frames [][]byte) ([]uint64, error)` 内部分配 seq；`AppendEncoded` 不变（relay 用） |
 | `internal/model/lineparse.go`（新增） | `ParseLine(line []byte) (meas string, tags [][2]string, ts int64, ok bool)` 零分配倾向解析（转义 `\,` `\=` `\ `、引号字符串字段、末 token 时间戳）；`SeriesKey(meas, tags) string` 规范化键（与 `Point.Key()` 前缀同构，供两路径共用） |
-| `internal/sender/fastpath.go`（新增） | FastPath 转发器 + 秒级分区去重集 + WAITING/ACTIVE 状态机 + 反压门 |
+| `internal/sender/fastpath.go`（新增） | FastPath 转发器 + 秒级分区去重集（V1.7.1 时间基准驱逐，内存有界）+ 反压门 |
 | `internal/sender/poller.go` | `pollOnce` 过滤点集（查去重集，命中跳过）；每轮更新快路径 cursor/状态 |
-| `internal/config` | `sync.fast_path: {listen, mode, activate_age, deactivate_age, dedup_window}` |
+| `internal/config` | `sync.fast_path: {listen, mode, dedup_window}`（V1.7 起 activate_age/deactivate_age 已移除，残留配置忽略） |
 | `cmd/sender` | 启动 FastPath HTTP server（listen 非空时）；注入 notify/WAL/metrics |
 | `internal/monitor` | 新增指标（见 §7） |
 | 文档 | 本文档 + configuration.md + README 版本记录 + architecture.md 数据流 + 部署订阅改造步骤（AGENT.md 上线待办同步） |
@@ -96,10 +95,8 @@
 sync:
   fast_path:
     listen: ":18097"        # 订阅推送地址（空=禁用，退化为纯轮询+旧 signal_listen）
-    mode: auto              # off=仅信号 / auto=追平自动启用（默认） / on=强制转发
-    activate_age: 5s        # cursor 年龄 ≤ 此值才启用（默认 watermark+3s）
-    deactivate_age: 30s     # 年龄 > 此值退回仅信号（迟滞，防抖）
-    dedup_window: 15s       # 去重集保留窗口（默认 watermark+5s）
+    mode: auto              # off=仅信号 / auto=on=启用即透传（默认；V1.7 起不再等游标追平）
+    dedup_window: 15s       # 去重集保留窗口（默认 watermark+5s；时间基准驱逐，只多不漏）
 ```
 
 源库订阅改造（ops，一次性）：
@@ -115,8 +112,8 @@ CREATE SUBSCRIPTION hx_sub ON HXScada.autogen DESTINATIONS ALL
 
 ## 7. 指标
 
-`fast_path_state`（0=off/1=waiting/2=active）、`fast_path_batches_total`、
-`fast_path_points_total`、`fast_path_signal_only_total`（WAITING 期）、
+`fast_path_state`（0=off/2=active；V1.7 起无 waiting 态）、`fast_path_batches_total`、
+`fast_path_points_total`、`fast_path_signal_only_total`（off 模式）、
 `fast_path_dropped_oversize|precision|backpressure_total`、`fast_path_line_skipped_total`、
 `fast_path_dedup_hits_total`（Poller 侧命中）、`fast_path_dedup_entries`（集大小）。
 
@@ -126,15 +123,15 @@ CREATE SUBSCRIPTION hx_sub ON HXScada.autogen DESTINATIONS ALL
   去重集（分区驱逐/打包键）、WAL AppendBatch（并发追加 seq 唯一连续、帧可解码）、
   状态机（activate/deactivate 迟滞/mode 三态）。
 - e2e：假订阅推送 + 假源查询 + 假目标——① ACTIVE 下推送批落库且 Poller 窗口去重后不再
-  重发（目标写计数=1）；② WAITING（游标落后）下推送不转发、Poller 照常补发零丢失；
+  重发（目标写计数=1）；② off 模式下推送不转发、Poller 照常补发零丢失；
   ③ 订阅丢弃（推一半断连）→ Poller 补齐零丢失；④ 反压丢批 → Poller 补齐。
 - `go test -race` 全绿；Benchmark 守卫（解析 + 去重集吞吐 ≥ 20 万点/s 单核）。
 
 ## 9. 上线步骤（灰度）
 
 1. 源库 DROP+CREATE 订阅加目的地、调 flush-interval；
-2. 部署 sender（`fast_path.listen` 打开，mode=auto）；观察 `fast_path_state`：回填期应为
-   waiting，追平后自动 active；
+2. 部署 sender（`fast_path.listen` 打开，mode=auto）；观察 `fast_path_state`：启动即
+   active（V1.7 起无 waiting 态），实时点立即透传，历史由回填并行补齐；
 3. 对比 `sync_e2e_delay_seconds` 从 ~4.2s 降到 <1s；`dup_total`/`fast_path_dedup_hits`
    验证去重生效；
 4. 回滚：`mode: off` 或清空 listen 即退回纯轮询，无数据面影响。

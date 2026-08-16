@@ -56,9 +56,9 @@ type SenderConfig struct {
 		SignalListen      string `yaml:"signal_listen"`       // 订阅信号监听地址（如 ":18098"）；空=纯轮询
 		SignalMinInterval string `yaml:"signal_min_interval"` // 订阅信号最小查询间隔（默认 200ms）
 		FastPath          struct {
-			Listen        string `yaml:"listen"`         // A4 fast-path 订阅监听地址；空=禁用
-			Mode          string `yaml:"mode"`           // off=仅信号 / auto=游标追平自动启用（默认） / on=强制转发
-			DedupWindow   string `yaml:"dedup_window"`   // 去重集保留窗口（默认 watermark+5s）
+			Listen      string `yaml:"listen"`       // A4 fast-path 订阅监听地址；空=禁用
+			Mode        string `yaml:"mode"`         // off=仅信号 / auto、on=启用即透传（V1.7：auto≡on，不再等游标追平）
+			DedupWindow string `yaml:"dedup_window"` // 去重集保留窗口（默认 watermark+5s）
 		} `yaml:"fast_path"`
 		Backfill     string   `yaml:"backfill"`     // 首次启动回填：游标初始化为 now-watermark-backfill
 		TagColumns   []string `yaml:"tag_columns"`  // 显式 tag 列（空=自动 SHOW TAG KEYS 发现）
@@ -202,18 +202,18 @@ func (c *SenderConfig) Validate() error {
 		return fmt.Errorf("config: wal.path required")
 	}
 	for name, s := range map[string]string{
-		"sync.interval":                 c.Sync.Interval,
-		"sync.window":                   c.Sync.Window,
-		"sync.watermark":                c.Sync.Watermark,
-		"sync.max_window":               c.Sync.MaxWindow,
-		"sync.signal_min_interval":      c.Sync.SignalMinInterval,
-		"sync.fast_path.dedup_window":   c.Sync.FastPath.DedupWindow,
-		"sync.backfill":                 c.Sync.Backfill,
-		"tcp.timeout":                   c.TCP.Timeout,
-		"tcp.dial_timeout":              c.TCP.DialTimeout,
-		"sender.backoff_base":           c.Sender.BackoffBase,
-		"sender.backoff_max":            c.Sender.BackoffMax,
-		"sender.heartbeat_interval":     c.Sender.HeartbeatInterval,
+		"sync.interval":               c.Sync.Interval,
+		"sync.window":                 c.Sync.Window,
+		"sync.watermark":              c.Sync.Watermark,
+		"sync.max_window":             c.Sync.MaxWindow,
+		"sync.signal_min_interval":    c.Sync.SignalMinInterval,
+		"sync.fast_path.dedup_window": c.Sync.FastPath.DedupWindow,
+		"sync.backfill":               c.Sync.Backfill,
+		"tcp.timeout":                 c.TCP.Timeout,
+		"tcp.dial_timeout":            c.TCP.DialTimeout,
+		"sender.backoff_base":         c.Sender.BackoffBase,
+		"sender.backoff_max":          c.Sender.BackoffMax,
+		"sender.heartbeat_interval":   c.Sender.HeartbeatInterval,
 	} {
 		if err := validateDur(name, s); err != nil {
 			return err
@@ -229,8 +229,12 @@ func (c *SenderConfig) Validate() error {
 		return fmt.Errorf("config: tcp.compression must be zstd/gzip, got %q", cp)
 	}
 	if b := strings.TrimSpace(c.Sync.Backfill); b != "" && b != "all" && b != "0" {
-		if _, err := parseDurationExt(b); err != nil {
+		d, err := parseDurationExt(b)
+		if err != nil {
 			return fmt.Errorf("config: sync.backfill must be all/0/时长(如 30d), got %q", b)
+		}
+		if d < 0 {
+			return fmt.Errorf("config: sync.backfill: negative duration %q not allowed", b)
 		}
 	}
 	return nil
@@ -388,7 +392,8 @@ type BackfillSpec struct {
 }
 
 // BackfillSpec 解析 sync.backfill：默认（空）与 "all" 均按全量处理；"0" 为仅实时；
-// 其余为时长（支持 d）。解析失败回退全量（Validate 已先行拦截）。
+// 其余为时长（支持 d）。V1.7.1：0 时长（如 "0d"）与负值归入仅实时——
+// 负值已被 Validate 拦截，此处兜底不落入全量（防意外全库重发）。
 func (c *SenderConfig) BackfillSpec() BackfillSpec {
 	v := strings.TrimSpace(c.Sync.Backfill)
 	if v == "" || v == "all" {
@@ -399,7 +404,7 @@ func (c *SenderConfig) BackfillSpec() BackfillSpec {
 	}
 	d, err := parseDurationExt(v)
 	if err != nil || d <= 0 {
-		return BackfillSpec{Mode: BackfillAll}
+		return BackfillSpec{Mode: BackfillNone}
 	}
 	return BackfillSpec{Mode: BackfillDuration, Dur: d}
 }

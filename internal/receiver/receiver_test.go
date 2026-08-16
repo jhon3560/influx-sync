@@ -716,3 +716,44 @@ func TestGapWarnReset(t *testing.T) {
 		t.Fatal("after reset window, warn must be allowed again")
 	}
 }
+
+// TestDLQFrameTypeRecorded N12 回归：zstd 帧的毒丸 DLQ 必须记录 frame_type=0x04，
+// 否则重放时无法确定解压算法（payload_gzip_base64 字段名是历史遗留）。
+func TestDLQFrameTypeRecorded(t *testing.T) {
+	dlqDir := filepath.Join(t.TempDir(), "dlq")
+	srv, _ := fakeTargetCode(t, 400, "field type conflict")
+	r := newTestReceiver(t, srv, Config{DLQDir: dlqDir})
+	fb, err := protocol.EncodeDataZstd(1, []byte("m value=1 1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ack := r.HandleFrame(1, 0, fb); ack != protocol.AckSuccess {
+		t.Fatalf("poison ack=%x", ack)
+	}
+	entries, _ := os.ReadDir(dlqDir)
+	if len(entries) != 1 {
+		t.Fatalf("dlq files=%d", len(entries))
+	}
+	data, _ := os.ReadFile(filepath.Join(dlqDir, entries[0].Name()))
+	var meta DLQMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta.FrameType != protocol.TypeDataZstd {
+		t.Fatalf("frame_type=%d, want %d (zstd)", meta.FrameType, protocol.TypeDataZstd)
+	}
+	// gzip 帧照常记录 0x01
+	dlqDir2 := filepath.Join(t.TempDir(), "dlq2")
+	r2 := newTestReceiver(t, srv, Config{DLQDir: dlqDir2})
+	fb2, _ := protocol.EncodeData(1, []byte("m value=1 1"))
+	if ack := r2.HandleFrame(1, 0, fb2); ack != protocol.AckSuccess {
+		t.Fatalf("ack=%x", ack)
+	}
+	entries2, _ := os.ReadDir(dlqDir2)
+	data2, _ := os.ReadFile(filepath.Join(dlqDir2, entries2[0].Name()))
+	var meta2 DLQMeta
+	json.Unmarshal(data2, &meta2)
+	if meta2.FrameType != protocol.TypeData {
+		t.Fatalf("frame_type=%d, want %d (gzip)", meta2.FrameType, protocol.TypeData)
+	}
+}
