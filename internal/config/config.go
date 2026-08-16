@@ -53,7 +53,7 @@ type SenderConfig struct {
 		BatchPoints       int    `yaml:"batch_points"`        // 单帧点数
 		WindowTarget      int    `yaml:"window_target"`       // N16 窗口增长目标点数（默认=batch_points）
 		QueryLimit        int    `yaml:"query_limit"`         // 单次查询 LIMIT（分页粒度）
-		ParallelQueries   int    `yaml:"poller_parallel"`     // 多窗口并行查询数（0=串行，默认4）
+		ParallelQueries   int    `yaml:"poller_parallel"`     // 多窗口并行查询数（0=默认4/1=串行）
 		SignalListen      string `yaml:"signal_listen"`       // 订阅信号监听地址（如 ":18098"）；空=纯轮询
 		SignalMinInterval string `yaml:"signal_min_interval"` // 订阅信号最小查询间隔（默认 200ms）
 		FastPath          struct {
