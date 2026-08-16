@@ -366,12 +366,16 @@ func TestFastDedupSeriesBounded(t *testing.T) {
 	if len(d.idRefs) != n {
 		t.Fatalf("refs=%d, want %d", len(d.idRefs), n)
 	}
-	// 全部条目驱逐后：series 名必须被惰性清理（R1）
+	// 全部条目驱逐后：series 名必须被惰性清理（R1），idName 逆向映射同步清零（R3b）
 	d.evictLocked(time.Now().Add(2 * d.retention).UnixNano())
 	left := len(d.series)
+	idNameLeft := len(d.idName)
 	d.mu.Unlock()
 	if left != 0 {
 		t.Fatalf("series map not cleaned after eviction: %d entries left", left)
+	}
+	if idNameLeft != 0 {
+		t.Fatalf("idName not cleaned after eviction: %d entries left (R3b)", idNameLeft)
 	}
 	if d.Len() != 0 {
 		t.Fatalf("dedup entries=%d, want 0", d.Len())
@@ -401,5 +405,52 @@ func TestFastDedupSeriesRefcountKeepsActive(t *testing.T) {
 	}
 	if d.Contains("m|s=1|", now-20*int64(time.Second)) {
 		t.Fatal("old entry must be evicted")
+	}
+}
+
+// TestFastDedupDuplicateRegistrationNoLeak R3a 回归：同 (series, ts) 重复登记
+// （客户端同 ts 重写 → 订阅推两次）不得双计引用——驱逐后引用与 series 名必须归零。
+func TestFastDedupDuplicateRegistrationNoLeak(t *testing.T) {
+	d := newFastDedup(15 * time.Second)
+	now := time.Now().UnixNano()
+	d.Add("m|s=1|", now)
+	d.Add("m|s=1|", now) // 重复登记
+	d.mu.Lock()
+	var refs int
+	if id, ok := d.series["m|s=1|"]; ok {
+		refs = d.idRefs[id]
+	}
+	d.mu.Unlock()
+	if refs != 1 {
+		t.Fatalf("refs=%d, want 1 (duplicate registration must not double-count)", refs)
+	}
+	d.mu.Lock()
+	d.evictLocked(time.Now().Add(2 * d.retention).UnixNano())
+	nSeries := len(d.series)
+	nName := len(d.idName)
+	nRefs := len(d.idRefs)
+	d.mu.Unlock()
+	if nSeries != 0 || nName != 0 || nRefs != 0 {
+		t.Fatalf("leak after eviction: series=%d idName=%d idRefs=%d (want 0/0/0)", nSeries, nName, nRefs)
+	}
+}
+
+// TestFastDedupHighCardinalityFullyBounded R3b 回归：20 万 unique series 全驱逐后
+// series/idName/idRefs 全部归零——"换一种 OOM"的槽位残留路径被封死。
+func TestFastDedupHighCardinalityFullyBounded(t *testing.T) {
+	d := newFastDedup(15 * time.Second)
+	now := time.Now().UnixNano()
+	const n = 200000
+	for i := 0; i < n; i++ {
+		d.Add(fmt.Sprintf("m|id=%d|", i), now)
+	}
+	d.mu.Lock()
+	d.evictLocked(time.Now().Add(2 * d.retention).UnixNano())
+	nSeries := len(d.series)
+	nName := len(d.idName)
+	nRefs := len(d.idRefs)
+	d.mu.Unlock()
+	if nSeries != 0 || nName != 0 || nRefs != 0 {
+		t.Fatalf("unbounded after full eviction: series=%d idName=%d idRefs=%d (want 0/0/0)", nSeries, nName, nRefs)
 	}
 }

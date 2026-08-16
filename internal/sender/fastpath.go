@@ -57,8 +57,8 @@ const (
 type fastDedup struct {
 	mu        sync.Mutex
 	series    map[string]uint64
-	idName    []string       // id -> series 名（逆向查找，驱逐清理用）
-	idRefs    map[uint64]int // id -> 活跃条目引用计数（R1：最后一个条目驱逐时惰性清理 series）
+	idName    map[uint64]string // id -> series 名（逆向查找；R3b：map 而非切片，清理即删键，与活跃 series 数成正比）
+	idRefs    map[uint64]int    // id -> 活跃条目引用计数（R1：最后一个条目驱逐时惰性清理 series）
 	nextID    uint64
 	parts     map[int64]map[uint64]struct{} // 秒 -> packed(id, offset)
 	retention time.Duration
@@ -87,9 +87,9 @@ func (d *fastDedup) SetCursor(cursorNs int64) {
 }
 
 // evictLocked 删除 sec < cutSec 的分区（调用方持锁）。
-// R1：驱逐条目时按 ID 引用计数回退，某 series 的最后一个条目被驱逐后
-// 惰性清理其 series 名——病态高基数场景（tag 近似唯一 ID）下 series 映射
-// 也不再无界增长。
+// R1/R3：驱逐条目时按 ID 引用计数回退，某 series 的最后一个条目被驱逐后
+// 惰性清理其 series 名与 idName 逆向项（map 删除键，无槽位残留）——
+// 病态高基数场景（tag 近似唯一 ID）下全部映射有界。
 func (d *fastDedup) evictLocked(cutNs int64) {
 	cut := cutNs / int64(time.Second)
 	for sec, part := range d.parts {
@@ -101,10 +101,10 @@ func (d *fastDedup) evictLocked(cutNs int64) {
 			if n := d.idRefs[id] - 1; n > 0 {
 				d.idRefs[id] = n
 			} else {
-				// 该 series 已无活跃条目：回收 ID 名称映射
-				if int(id) < len(d.idName) && d.idName[id] != "" {
-					delete(d.series, d.idName[id])
-					d.idName[id] = ""
+				// 该 series 已无活跃条目：回收 ID 名称映射（键删除，无槽位残留）
+				if name, ok := d.idName[id]; ok {
+					delete(d.series, name)
+					delete(d.idName, id)
 				}
 				delete(d.idRefs, id)
 			}
@@ -132,8 +132,8 @@ func (d *fastDedup) Add(seriesKey string, ts int64) {
 		id = d.nextID
 		d.nextID++
 		d.series[seriesKey] = id
-		for len(d.idName) <= int(id) {
-			d.idName = append(d.idName, "")
+		if d.idName == nil {
+			d.idName = make(map[uint64]string)
 		}
 		d.idName[id] = seriesKey
 	}
@@ -143,11 +143,16 @@ func (d *fastDedup) Add(seriesKey string, ts int64) {
 		part = make(map[uint64]struct{})
 		d.parts[sec] = part
 	}
-	part[id<<30|uint64(ts-sec*int64(time.Second))] = struct{}{}
-	if d.idRefs == nil {
-		d.idRefs = make(map[uint64]int)
+	packed := id<<30 | uint64(ts-sec*int64(time.Second))
+	// R3a：仅在条目**首次**插入时计数——同 (series, ts) 重复登记（客户端同 ts
+	// 重写 → 订阅推两次）不得双计引用，否则驱逐后残留引用 → series 名泄漏。
+	if _, exists := part[packed]; !exists {
+		part[packed] = struct{}{}
+		if d.idRefs == nil {
+			d.idRefs = make(map[uint64]int)
+		}
+		d.idRefs[id]++
 	}
-	d.idRefs[id]++
 }
 
 // Contains 查询点是否已由快路径转发。
