@@ -1,7 +1,8 @@
 # 实测部署记录：隔离装置真机同步（2026-08-16）
 
-> 状态：**进行中**。本机 203.0.113.100 → 隔离装置 → 对端 203.0.113.240。
-> 产品：influx-sync V1.7.7（tag v1.7.7，部署期修复 5 个缺陷 N12~N15 等，二进制 SHA256 见 SHA256SUMS）。
+> 状态：**已收尾（2026-08-16 10:00，用户叫停）**。本机 203.0.113.100 → 隔离装置 →
+> 对端 203.0.113.240。产品：influx-sync **V1.8.0**（tag v1.8.0；部署期连修 6 个缺陷
+> V1.7.4~V1.8.0：坑3/N13、N12、N14、N15、N16+bench 工具修复）。
 > 文档归属：docs/（AGENT.md §6 交接面），由双 AI 互审。
 
 ## 1. 环境
@@ -163,7 +164,37 @@ http://203.0.113.1:80/apis/influx/subscription），恢复后的 influxd 会向�
 
 **结论：WAL+seq+幂等+zstd+滑窗链路零丢失，浮点值位级保真。**
 
-## 5. 收尾/恢复对端（测试完成后执行）
+## 5. 收尾/恢复对端（已执行 2026-08-16 10:00）
+
+用户 2026-08-16 09:55 叫停测试（"行了不用测了"），按约定恢复对方数据。已执行：
+
+1. 本机：停 sender（V1.8.0）、停 docker 源库容器（`docker stop sync-src`，数据卷保留）；
+2. 对端：`pkill receiver`；`rm -rf /opt/influx-sync-test`；`DROP DATABASE mhdb_main_sync`；
+3. 恢复验证：对端 `SHOW DATABASES` = `_internal, mydb, equdb, pmudb, mhdb` **与初始完全一致**，
+   端口 28101/28102 已释放，/opt 无残留。
+
+**回填未完成状态说明**：停止时游标 2026-01-26（历史区 ~47%，2025-12-15→2026-01-26
+已同步且抽验逐位一致）。发送端 WAL checkpoint 保留在
+`/home/USER/influx-sync-test/wal`——**如需继续，重启本机 docker 源库 + V1.8.0 sender
+即从游标断点续传，无需重新导入**（backfill 策略值未变，游标不回拨）。
+
+### 5.1 如需彻底清理本机
+
+```bash
+docker rm -f sync-src && docker volume rm sync-src-data   # 释放 21GB 恢复数据
+rm -rf /home/USER/influx-sync-test                          # 测试配置/WAL/日志
+```
+
+## 6. 总结：本轮实测产出
+
+| 类别 | 结果 |
+|---|---|
+| 全链路验证 | 冒烟 20000/20000 逐位一致；已同步区间（3 组查询含浮点位级）零丢失零误差 |
+| 实时快路径 | 订阅透传端到端 **<1s**（对端最新点时间戳=写入时刻） |
+| 装置特性 | 通道吞吐 ~57 Mbit/s；允许多帧在途（pipeline 8 全程 ack_fail=0）；停等 RTT ~1.5s/帧 |
+| 缺陷修复 | 6 个（配置校验拒收默认值 / SHOW SHARD GROUPS 列错位丢最老一周 / 稀疏回填速率封顶 / 64MB 响应截断停滞 / 查询预取流水线+window_target 解耦 / loadgen 挂死），V1.7.4→V1.8.0 全带回归测试 |
+| 性能结论 | 瓶颈=源库胖行（400+ 字段/行）查询产出，非装置/带宽（4.8 Mbit/s vs 57 Mbit/s 上限）；N16 后 0.41→0.76 天/分钟、0.96→8.8 fps |
+| 环境恢复 | 对端数据库/端口/目录 100% 还原，无残留进程 |
 
 1. 对端：`pkill -f influx-sync-test/bin/receiver`；`rm -rf /opt/influx-sync-test`
 2. 对端：`influx -username root -password SECRET_REDACTED -execute "DROP DATABASE mhdb_main_sync"`
