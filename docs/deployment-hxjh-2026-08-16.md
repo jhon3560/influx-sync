@@ -178,7 +178,16 @@ http://203.0.113.1:80/apis/influx/subscription），恢复后的 influxd 会向�
 `/home/USER/influx-sync-test/wal`——**如需继续，重启本机 docker 源库 + V1.8.0 sender
 即从游标断点续传，无需重新导入**（backfill 策略值未变，游标不回拨）。
 
-### 5.1 如需彻底清理本机
+### 5.1 本机数据保留（用户决定，2026-08-16）
+
+用户确认：**本机测试数据暂不清理，后续测试可能用到**。保留现状：
+
+- `sync-src` 容器（Exited）+ `sync-src-data` 卷：恢复的 mhdb_main 21GB 源库，
+  后续测试 `docker start sync-src` 即用；
+- `/home/USER/influx-sync-test/`：两端配置、sender WAL checkpoint（**回填断点，
+  重启 V1.8.0 sender 即从 2026-01-26 续传**）、运行日志（证据）。
+
+如未来决定彻底清理：
 
 ```bash
 docker rm -f sync-src && docker volume rm sync-src-data   # 释放 21GB 恢复数据
