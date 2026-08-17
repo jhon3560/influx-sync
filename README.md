@@ -1,61 +1,16 @@
 # influx-sync
 
-InfluxDB 跨正向隔离同步系统（ISFP 协议，V1.5.0）。
+InfluxDB 跨正向隔离同步系统（ISFP 协议，V1.8.0）。
 
 **功能**：安全区 I 的 InfluxDB 1.x 数据 → 正向隔离装置（TCP 映射）→ 安全区 III 的 InfluxDB 1.x，
 单向、有序、At-Least-Once、断点续传同步。实测 **20 万点/s 实时零丢失**（64 核/124G，麒麟 V10）。
-
-## 架构图
-
-```mermaid
-flowchart LR
-    subgraph ZI["安全区 I（源端）"]
-        SRC[("源 InfluxDB 1.x")]
-        SUB["SUBSCRIPTION 推送"]
-    end
-    subgraph SND["sender（隔离装置前）"]
-        SIG["SignalListener<br/>订阅信号"]
-        FP["FastPath<br/>订阅透传 <1s"]
-        POL["Poller<br/>窗口轮询 + 反压"]
-        WAL[("WAL<br/>分段 + checkpoint")]
-        SD["Sender<br/>停等/滑窗 ACK"]
-    end
-    subgraph DEV["正向隔离装置"]
-        MAP["TCP 映射<br/>单字节 ACK"]
-    end
-    subgraph RCV["receiver（隔离装置后）"]
-        SRV["TCP Server<br/>并发写库 + 按序 ACK"]
-        DED["去重<br/>last_seq 连续前缀"]
-        WR["写库<br/>WriteRaw"]
-        DLQ[("DLQ<br/>毒丸隔离")]
-        RLY["Relay<br/>转发 WAL"]
-    end
-    subgraph ZIII["安全区 III（目标端）"]
-        TGT[("目标 InfluxDB")]
-        NEXT[("下一跳 receiver")]
-    end
-
-    SRC -->|"轮询查询<br/>(cursor, now-watermark)"| POL
-    SUB --> SIG --> POL
-    SUB --> FP --> WAL
-    POL --> WAL
-    WAL --> SD -->|"ISFP 帧<br/>gzip/zstd+CRC"| MAP --> SRV
-    SRV --> DED --> WR --> TGT
-    WR -->|"写失败 4xx"| DLQ
-    WR -->|"写成功"| RLY --> NEXT
-    SRV -.->|"0xff/0x00"| MAP -.-> SD
-
-    style WAL fill:#f9f,stroke:#333
-    style DLQ fill:#f99,stroke:#333
-    style DEV fill:#ffd,stroke:#333
-```
 
 ## 能力概览
 
 | 能力 | 说明 |
 |---|---|
 | 数据获取 | 时间窗口轮询（正确性基座）+ 订阅 fast-path 透传（V1.5，实时性加速，游标追平自动启用）+ 订阅信号（不丢弃、延迟触发），游标 + WAL 缓冲，支持历史回填 |
-| 传输 | ISFP：20B 头 + gzip(Line Protocol) + CRC32；停等协议（适配隔离装置单字节 ACK）；滑窗（实验项，需装置验证） |
+| 传输 | ISFP：20B 头 + gzip/zstd(Line Protocol) + CRC32；停等协议（适配隔离装置单字节 ACK）；滑窗（实机验证：本装置支持 8 帧在途，生产可开 pipeline_window=4~8；换装置需复测） |
 | 可靠性 | WAL group commit + 停等 ACK + last_seq 连续前缀去重 + 断点续传 + DLQ 毒丸隔离 + 中继 DLQ + 反压三级水位 + WAL 撕裂尾自恢复 |
 | 实时性（V1.5） | fast-path：订阅推送直接透传，端到端延迟 watermark+~2.2s → flush 间隔+传输（<1s）；快路径一切退化方向都是重复/回退轮询，零丢失不变 |
 | 性能（V1.4） | 组帧 60x CPU（544ns/点）、边界去重零全窗口 map、checkpoint 节流、并发写库+按序 ACK、schema single-flight |
@@ -82,7 +37,14 @@ flowchart LR
 | v1.5.0 | A4 订阅 fast-path 透传：推送批直进 WAL（同 gzip 管线），游标追平自动启用（auto/on/off 三态 + 迟滞），秒级分区去重集抑制轮询重复转发，WAL 并发追加 API，订阅改造成 ops 步骤（见 docs/a4-fast-path.md） |
 | v1.6.0 | 帧压缩支持 zstd（TypeDataZstd 帧类型即算法标识，Version=1 布局不变）；tcp.compression: zstd(默认)/gzip；本机压测链路带宽 zstd ≈ gzip 的 1/2~1/3 |
 | v1.7.0 | backfill 重设计：默认 all 全量同步（0=仅实时/Nd=有界，支持 d 单位）；快路径启用即透传（移除追平门控）；配置变化一次性回拨游标（免清数据目录，存量升级只记录不回拨）；SHOW SHARD GROUPS 数据起点定位 + 空窗翻倍跳过 |
-| v1.7.3 | 二轮审计修复（N9-N16）：去重集时间基准驱逐（修回填期 OOM）+ 键碰撞消除（修静默丢点）+ 真空区切片扫描（修 1h 窗口 OOM）+ DLQ 帧类型记录 + backfill 边界 + 4 个小项 |
+| v1.7.1 | 二轮审计修复（N9-N16）：去重集时间基准驱逐（修回填期 OOM）+ 键碰撞消除（修静默丢点）+ 真空区切片扫描（修 1h 窗口 OOM）+ DLQ 帧类型记录 + backfill 边界 + 4 个小项 |
+| v1.7.2 | 复审跟进（R1/R2）：去重集 series 映射引用计数惰性清理（修病态高基数 OOM 残余）+ 注释修正 |
+| v1.7.3 | 复审跟进（R3a/R3b）：重复登记不双计引用 + idName 改 map（清理即删键）——去重集四层映射全部有界 |
+| v1.7.4 | 真机拦截：backfill: all 被 duration 校验误拒修复（文档默认值可达） |
+| v1.7.5 | 真机拦截：SHOW SHARD GROUPS 列错位修复（N12，旧代码取 end_time 致最老一段静默丢失） |
+| v1.7.6 | 真机拦截：N14 欠满窗口翻倍——稀疏库回填不再被基础窗口封顶（实测 ~60×） |
+| v1.7.7 | 真机拦截：N15 查询响应 64MB 静默截断致回填停滞修复（512MB+显式报错+失败自愈） |
+| v1.8.0 | 真机拦截：N16 查询预取流水线 + window_target 解耦（0.41→0.76 天/分钟）；隔离装置全链路验证：逐位一致（浮点位级）、快路径 <1s、滑窗 8 帧在途 ack_fail=0 |
 
 ## 目录
 
