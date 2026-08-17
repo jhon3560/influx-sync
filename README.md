@@ -5,6 +5,51 @@ InfluxDB 跨正向隔离同步系统（ISFP 协议，V1.5.0）。
 **功能**：安全区 I 的 InfluxDB 1.x 数据 → 正向隔离装置（TCP 映射）→ 安全区 III 的 InfluxDB 1.x，
 单向、有序、At-Least-Once、断点续传同步。实测 **20 万点/s 实时零丢失**（64 核/124G，麒麟 V10）。
 
+## 架构图
+
+```mermaid
+flowchart LR
+    subgraph ZI["安全区 I（源端）"]
+        SRC[("源 InfluxDB 1.x")]
+        SUB["SUBSCRIPTION 推送"]
+    end
+    subgraph SND["sender（隔离装置前）"]
+        SIG["SignalListener<br/>订阅信号"]
+        FP["FastPath<br/>订阅透传 <1s"]
+        POL["Poller<br/>窗口轮询 + 反压"]
+        WAL[("WAL<br/>分段 + checkpoint")]
+        SD["Sender<br/>停等/滑窗 ACK"]
+    end
+    subgraph DEV["正向隔离装置"]
+        MAP["TCP 映射<br/>单字节 ACK"]
+    end
+    subgraph RCV["receiver（隔离装置后）"]
+        SRV["TCP Server<br/>并发写库 + 按序 ACK"]
+        DED["去重<br/>last_seq 连续前缀"]
+        WR["写库<br/>WriteRaw"]
+        DLQ[("DLQ<br/>毒丸隔离")]
+        RLY["Relay<br/>转发 WAL"]
+    end
+    subgraph ZIII["安全区 III（目标端）"]
+        TGT[("目标 InfluxDB")]
+        NEXT[("下一跳 receiver")]
+    end
+
+    SRC -->|"轮询查询<br/>(cursor, now-watermark)"| POL
+    SUB --> SIG --> POL
+    SUB --> FP --> WAL
+    POL --> WAL
+    WAL --> SD -->|"ISFP 帧<br/>gzip/zstd+CRC"| MAP --> SRV
+    SRV --> DED --> WR --> TGT
+    WR -->|"写失败 4xx"| DLQ
+    WR -->|"写成功"| RLY --> NEXT
+    SRV -.->|"0xff/0x00"| MAP -.-> SD
+
+    style WAL fill:#f9f,stroke:#333
+    style DLQ fill:#f99,stroke:#333
+    style DEV fill:#ffd,stroke:#333
+```
+
 ## 能力概览
 
 | 能力 | 说明 |

@@ -1,0 +1,15 @@
+# 构建产物
+bin/
+*.exe
+*.test
+
+# 本地配置与数据
+configs/
+*.yaml.local
+/data/
+*.log
+
+# 编辑器/系统
+.DS_Store
+.idea/
+.vscode/
